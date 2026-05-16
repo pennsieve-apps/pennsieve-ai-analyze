@@ -1,0 +1,50 @@
+[project]
+name = "pennsieve-ai-analyze"
+version = "0.0.1"
+description = "Pennsieve compute-node processor — stage 3 of the pennsieve-ai research pipeline. Agentic analysis: data inspection → notebook generation → execution → methods critique, all in a Claude-Code-driven loop."
+requires-python = ">=3.12"
+dependencies = [
+    # Claude Agent SDK — wraps the Claude Code CLI in a Python interface.
+    # In an LLM-enabled ECS task the platform injects ANTHROPIC_BASE_URL
+    # pointing at the localhost sidecar (http://localhost:8765), so the
+    # SDK's HTTP calls land at the in-task proxy and get bridged to the
+    # governor via lambda:Invoke. No public API endpoints involved.
+    "claude-agent-sdk>=0.2",
+
+    # pennsieve-llm — used for the few non-Anthropic-SDK paths (budget
+    # checks via GET /v1/budget, EFS document content blocks). Pulls
+    # in anthropic, httpx, boto3 transitively.
+    "pennsieve-llm>=0.5.0",
+
+    "numpy>=1.26",
+    "json-repair>=0.30",
+    # Notebook execution (papermill drives Jupyter; nbformat for I/O).
+    "papermill>=2.6",
+    "nbformat>=5.10",
+    "jupytext>=1.16",
+    # Common analysis stack the agent will reach for. Pre-installed so
+    # the agent doesn't burn turns running pip install inside its loop.
+    "pandas>=2.2",
+    "scipy>=1.13",
+    "statsmodels>=0.14",
+    "matplotlib>=3.9",
+    "openpyxl>=3.1",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+analyze = ["prompts/*.md"]
