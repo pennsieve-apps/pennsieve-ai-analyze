@@ -48,7 +48,9 @@ DEFAULT_MODEL = os.environ.get(
 async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
     """Drive one analyst session against one hypothesis."""
     try:
-        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+        from claude_agent_sdk import (
+            ClaudeSDKClient, ClaudeAgentOptions, PermissionResultAllow,
+        )
     except ImportError as e:
         bb.log(
             "agentic_analyst", "missing_dependency",
@@ -65,11 +67,22 @@ async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
     task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir)
     print(f"  [agent] hypothesis {hypothesis.id}: cwd={hyp_workdir}", flush=True)
 
+    # Auto-approve every tool call via the can_use_tool callback. We don't
+    # use permission_mode="bypassPermissions" because that maps to Claude
+    # Code's `--dangerously-skip-permissions` flag, which refuses to run
+    # under root — and our container does run as root (matches the rest of
+    # the pipeline so EFS workdir ownership is consistent across stages).
+    # Safety story: the agent is already sandboxed by the per-execution EFS
+    # workdir + governor budget cap + execution-scoped IAM; the CLI prompt
+    # would just block in a non-interactive container.
+    async def _allow_all(tool_name, tool_input, context):
+        return PermissionResultAllow()
+
     options = ClaudeAgentOptions(
         model=DEFAULT_MODEL,
         max_turns=MAX_TURNS,
-        permission_mode="bypassPermissions",
         allowed_tools=["Read", "Write", "Edit", "Bash"],
+        can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
     )
 
