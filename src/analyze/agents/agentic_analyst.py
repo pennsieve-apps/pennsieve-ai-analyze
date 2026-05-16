@@ -142,6 +142,11 @@ You have Read, Write, Edit, and Bash tools. Use Bash to run Python:
 `{venv_python}` has pandas, scipy, statsmodels, matplotlib, papermill,
 nbformat, jupytext, httpx, and openpyxl pre-installed.
 
+If you need a package that's not pre-installed (e.g., `lifelines`,
+`pynwb`, `nibabel`), install it with `pip install --user <package>`.
+The `--user` flag is required because this container runs without
+root privileges; standard `pip install` will fail.
+
 ## Hypothesis {hypothesis.id}
 
 **Claim to test:** {hypothesis.claim}

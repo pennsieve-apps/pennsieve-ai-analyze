@@ -28,6 +28,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The Claude Agent SDK shells out to this binary.
 RUN npm install -g @anthropic-ai/claude-code
 
+# Pre-create a writable HOME for UID 1000. Reason: at runtime the
+# Claude Code agent routinely needs to `pip install <specialty-pkg>` to
+# test a hypothesis (e.g., `lifelines`, `pynwb`, domain-specific deps
+# we haven't pre-installed). With a non-root container, `pip install`
+# without flags fails on the root-owned site-packages; `pip install
+# --user` then falls back to $HOME/.local — but only if HOME is set
+# and writable. This setup makes both root-mode (today) and
+# UID-1000-mode (post-non-root migration) work transparently.
+RUN useradd -u 1000 -m -s /bin/bash agent && \
+    mkdir -p /home/agent/.local/bin && \
+    chown -R 1000:1000 /home/agent
+ENV HOME=/home/agent
+ENV PATH=/home/agent/.local/bin:${PATH}
+
 WORKDIR /app
 
 # Source must be in place before `pip install .` because pyproject.toml's
