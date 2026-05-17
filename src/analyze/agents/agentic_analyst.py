@@ -44,6 +44,69 @@ DEFAULT_MODEL = os.environ.get(
     "VP_ANALYZE_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
 )
 
+# How much of a tool call's input/output to surface in the log. Big enough
+# to be useful (full bash commands, file paths, first line of output), small
+# enough that CloudWatch doesn't get flooded when the agent is busy.
+_TOOL_INPUT_PREVIEW_CHARS = 200
+_TOOL_RESULT_PREVIEW_CHARS = 200
+
+
+def _truncate(s: str, limit: int) -> str:
+    """Truncate `s` to `limit` chars, appending an ellipsis if cut."""
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "…"
+
+
+def _format_tool_input(name: str, tool_input: dict) -> str:
+    """Render a tool_use block's input as a one-line CloudWatch preview.
+
+    Each tool gets a hand-picked shape so the log is actually readable:
+    Bash → the command, Read/Write/Edit → the path, Grep → pattern + path.
+    Unknown tools fall back to a truncated repr of the input dict.
+    """
+    if name == "Bash":
+        cmd = tool_input.get("command", "")
+        return _truncate(f"$ {cmd}", _TOOL_INPUT_PREVIEW_CHARS)
+    if name == "Read":
+        return tool_input.get("file_path", "")
+    if name == "Write":
+        path = tool_input.get("file_path", "")
+        body = tool_input.get("content", "") or ""
+        return f"{path} ({len(body)}B)"
+    if name == "Edit":
+        path = tool_input.get("file_path", "")
+        old = (tool_input.get("old_string", "") or "").split("\n", 1)[0]
+        return f"{path} | {_truncate(old, 80)} → …"
+    if name == "Grep":
+        return (f"{tool_input.get('pattern', '')} "
+                f"in {tool_input.get('path', '.')}")
+    if name == "Glob":
+        return tool_input.get("pattern", "")
+    return _truncate(str(tool_input), 120)
+
+
+def _format_tool_result(content) -> str:
+    """Render a tool_result block's content as a one-line CloudWatch preview.
+
+    SDK delivers content as a string (legacy) or a list of typed blocks
+    ({"type": "text", "text": "..."} or similar). We pull out the first
+    line and cap it. Anything we can't parse falls back to a short repr.
+    """
+    if isinstance(content, str):
+        return _truncate(content.split("\n", 1)[0], _TOOL_RESULT_PREVIEW_CHARS)
+    if isinstance(content, list):
+        for block in content:
+            text = None
+            if isinstance(block, dict):
+                text = block.get("text")
+            elif hasattr(block, "text"):
+                text = block.text
+            if text:
+                return _truncate(text.split("\n", 1)[0],
+                                 _TOOL_RESULT_PREVIEW_CHARS)
+    return _truncate(str(content), 120)
+
 
 async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
     """Drive one analyst session against one hypothesis."""
@@ -67,14 +130,13 @@ async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
     task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir)
     print(f"  [agent] hypothesis {hypothesis.id}: cwd={hyp_workdir}", flush=True)
 
-    # Auto-approve every tool call via the can_use_tool callback. We don't
-    # use permission_mode="bypassPermissions" because that maps to Claude
-    # Code's `--dangerously-skip-permissions` flag, which refuses to run
-    # under root — and our container does run as root (matches the rest of
-    # the pipeline so EFS workdir ownership is consistent across stages).
-    # Safety story: the agent is already sandboxed by the per-execution EFS
-    # workdir + governor budget cap + execution-scoped IAM; the CLI prompt
-    # would just block in a non-interactive container.
+    # Auto-approve every tool call via the can_use_tool callback. Safety
+    # story is the surrounding sandbox: the container runs as uid 1000
+    # (platform-enforced), the per-execution EFS access point caps
+    # filesystem reach to /data/{cn}/{run}/, the governor enforces the
+    # LLM budget, and the task IAM role is execution-scoped. The CLI's
+    # interactive prompt would just block in a non-interactive container
+    # anyway — `can_use_tool` makes the auto-approve explicit instead.
     async def _allow_all(tool_name, tool_input, context):
         return PermissionResultAllow()
 
@@ -98,11 +160,35 @@ async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
                 content = getattr(msg, "content", None) or []
                 if isinstance(content, list):
                     for block in content:
+                        # tool_use: agent invoking a tool. Log the tool name
+                        # plus a short preview of the input (Bash command,
+                        # file path, etc.) so CloudWatch shows what the
+                        # agent is actually doing, not just that it's busy.
                         if hasattr(block, "name") and hasattr(block, "input"):
                             tools_called.append(block.name)
-                            print(f"  [agent] tool: {block.name}", flush=True)
+                            preview = _format_tool_input(
+                                block.name, block.input or {})
+                            print(f"  [agent] {block.name}: {preview}",
+                                  flush=True)
+                        # tool_result: response coming back from the tool.
+                        # First line, capped at 200 chars. ✗ marks errors.
+                        elif (hasattr(block, "tool_use_id")
+                              and hasattr(block, "content")):
+                            marker = ("✗"
+                                      if getattr(block, "is_error", False)
+                                      else "→")
+                            result = _format_tool_result(block.content)
+                            print(f"  [agent] {marker} {result}", flush=True)
+                        # text: the agent's reasoning between tool calls,
+                        # and (at the end) its final summary. We print
+                        # every text block and track the last one as the
+                        # summary written to the blackboard.
                         elif hasattr(block, "text"):
-                            final_text = block.text
+                            text = (block.text or "").strip()
+                            if text:
+                                for line in text.split("\n"):
+                                    print(f"  [agent] {line}", flush=True)
+                                final_text = block.text
                 cost = getattr(msg, "total_cost_usd", None)
                 if cost is not None:
                     total_cost = max(total_cost, float(cost))
