@@ -11,9 +11,9 @@ dependencies = [
     # governor via lambda:Invoke. No public API endpoints involved.
     "claude-agent-sdk>=0.2",
 
-    # pennsieve-llm — used for the few non-Anthropic-SDK paths (budget
-    # checks via GET /v1/budget, EFS document content blocks). Pulls
-    # in anthropic, httpx, boto3 transitively.
+    # pennsieve-llm — governor transport for model discovery, preflight,
+    # and the direct methods-critic Messages API call. Pulls in anthropic,
+    # httpx, and boto3 transitively.
     "pennsieve-llm>=0.5.0",
 
     "numpy>=1.26",

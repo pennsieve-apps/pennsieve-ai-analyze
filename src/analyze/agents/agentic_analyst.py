@@ -36,16 +36,14 @@ from analyze.blackboard import Blackboard, Hypothesis
 # real-world data quirks; the agent should self-terminate well before.
 MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
 
-# Model selection. The governor's allow-list is the source of truth for
-# what's actually permitted; this list is just the preferred order. Each
-# entry is a Bedrock inference-profile ID (us.* for HIPAA-friendly US
-# region routing).
-DEFAULT_MODEL = os.environ.get(
-    "VP_ANALYZE_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-)
 
-
-async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
+async def run(
+    bb: Blackboard,
+    hypothesis: Hypothesis,
+    *,
+    workdir: Path,
+    model_id: str,
+) -> None:
     """Drive one analyst session against one hypothesis."""
     try:
         from claude_agent_sdk import (
@@ -65,7 +63,10 @@ async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
     hyp_workdir.mkdir(parents=True, exist_ok=True)
 
     task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir)
-    print(f"  [agent] hypothesis {hypothesis.id}: cwd={hyp_workdir}", flush=True)
+    print(
+        f"  [agent] hypothesis {hypothesis.id}: model={model_id} cwd={hyp_workdir}",
+        flush=True,
+    )
 
     # Auto-approve every tool call via the can_use_tool callback. We don't
     # use permission_mode="bypassPermissions" because that maps to Claude
@@ -79,7 +80,7 @@ async def run(bb: Blackboard, hypothesis: Hypothesis, *, workdir: Path) -> None:
         return PermissionResultAllow()
 
     options = ClaudeAgentOptions(
-        model=DEFAULT_MODEL,
+        model=model_id,
         max_turns=MAX_TURNS,
         allowed_tools=["Read", "Write", "Edit", "Bash"],
         can_use_tool=_allow_all,
