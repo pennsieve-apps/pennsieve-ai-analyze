@@ -55,7 +55,7 @@ async def run(
             "claude-agent-sdk is required for the analyze stage; install "
             "with `pip install claude-agent-sdk`. Original error: " + repr(e),
         )
-        return
+        raise RuntimeError("claude-agent-sdk is required for the analyze stage") from e
 
     # Per-hypothesis working subdirectory. The Claude Code session runs
     # with this as cwd so any files the agent writes are scoped here.
@@ -112,7 +112,9 @@ async def run(
             "agentic_analyst", "error",
             f"hypothesis {hypothesis.id}: agent loop failed: {e!r}",
         )
-        return
+        raise RuntimeError(
+            f"Agentic analysis failed for hypothesis {hypothesis.id}"
+        ) from e
 
     # Record artifacts on the hypothesis. The Write stage reads these to
     # produce the final report.
