@@ -82,6 +82,14 @@ def main() -> int:
     client = LLMClient()
 
     try:
+        bb.model_assignments = client.preflight()
+        bb.log(
+            "analyze", "models",
+            ", ".join(
+                f"{logical}={assignment['model_id']}"
+                for logical, assignment in sorted(bb.model_assignments.items())
+            ),
+        )
         asyncio.run(run_analyze(bb, client, workdir=output_dir))
     except Exception as e:
         bb.log("analyze", "fatal", repr(e))

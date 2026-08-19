@@ -22,11 +22,16 @@ from analyze.agents import agentic_analyst, methods_critic
 def _hypotheses_to_analyze(bb: Blackboard) -> list:
     """Pick which hypotheses get analyzed in this run.
 
-    Default: the top hypothesis by rank (or first in list if unranked).
-    Override via `VP_ANALYZE_TOP_N` env var.
+    Default: the first hypothesis in Hypothesize's final iteration. Locked
+    hypotheses keep their IDs across iterations, so selecting from the final
+    slate ensures Write later reads the same record that Analyze updates.
+    Override the count via `VP_ANALYZE_TOP_N`.
     """
     n = int(os.environ.get("VP_ANALYZE_TOP_N", "1"))
-    return list(bb.hypotheses)[:n]
+    if not bb.hypotheses:
+        return []
+    final_iteration = bb.iterations_completed or max(h.iteration for h in bb.hypotheses)
+    return list(bb.hypotheses_at(final_iteration))[:n]
 
 
 async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> None:
@@ -40,8 +45,11 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
         return
 
     print(f"\n--- agentic analyst (analyzing {len(targets)} hypothesis/es) ---")
+    analyst_model = client.resolve_model("sonnet")
     for hyp in targets:
-        await agentic_analyst.run(bb, hyp, workdir=workdir)
+        await agentic_analyst.run(
+            bb, hyp, workdir=workdir, model_id=analyst_model,
+        )
 
     print("\n--- methods critic ---")
     for hyp in targets:

@@ -1,6 +1,6 @@
 [project]
 name = "pennsieve-ai-analyze"
-version = "0.0.1"
+version = "0.0.3"
 description = "Pennsieve compute-node processor — stage 3 of the pennsieve-ai research pipeline. Agentic analysis: data inspection → notebook generation → execution → methods critique, all in a Claude-Code-driven loop."
 requires-python = ">=3.12"
 dependencies = [
@@ -11,9 +11,9 @@ dependencies = [
     # governor via lambda:Invoke. No public API endpoints involved.
     "claude-agent-sdk>=0.2",
 
-    # pennsieve-llm — used for the few non-Anthropic-SDK paths (budget
-    # checks via GET /v1/budget, EFS document content blocks). Pulls
-    # in anthropic, httpx, boto3 transitively.
+    # pennsieve-llm — governor transport for model discovery, preflight,
+    # and the direct methods-critic Messages API call. Pulls in anthropic,
+    # httpx, and boto3 transitively.
     "pennsieve-llm>=0.5.0",
 
     "numpy>=1.26",
@@ -48,3 +48,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 analyze = ["prompts/*.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

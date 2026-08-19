@@ -1,10 +1,10 @@
 """Methods Critic — single-shot LLM review of the agentic analyst's output.
 
-Not an agent loop: a plain Opus call that reads the analyst's summary
-text + the contents of the produced notebook and flags methodological
-issues (untested assumptions, inappropriate stats, missing controls,
-weak conclusions). The output is attached to the hypothesis so the
-Write stage can cite or rebut.
+Not an agent loop: a direct reasoning-role call that reads the analyst's
+summary text + the contents of the produced notebook and flags methodological
+issues (untested assumptions, inappropriate stats, missing controls, weak
+conclusions). The output is attached to the hypothesis so the Write stage can
+cite or rebut.
 
 Kept deliberately simple in the scaffold — the prototype's full critic
 runs a structured prompt with rubric-style sections; that can land in
@@ -68,7 +68,9 @@ Produce a JSON object with this shape:
     except Exception as e:
         bb.log("methods_critic", "error",
                f"hypothesis {hypothesis.id}: critique call failed: {e!r}")
-        return
+        raise RuntimeError(
+            f"Methods critique failed for hypothesis {hypothesis.id}"
+        ) from e
 
     hypothesis.methods_critique = result
     bb.log("methods_critic", "done",
