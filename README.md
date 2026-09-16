@@ -1,7 +1,5 @@
 # pennsieve-ai-analyze
 
-Local hardening update: only accepted final-round hypotheses are selected. `VP_ANALYZE_MAX_METHODS_ITERS` (default 3) bounds analyst/methods revisions with notebook and critique snapshots. SDK completion and executed notebooks are checked, tool events are retained, and the image includes a Jupyter kernel. Docker deployment is still pending.
-
 Stage 3 of the `pennsieve-ai-*` research pipeline. Reads the blackboard
 produced by [`pennsieve-ai-hypothesize`](https://github.com/Pennsieve/pennsieve-ai-hypothesize),
 runs an agentic analysis against the first accepted hypothesis in the final iteration
@@ -15,17 +13,21 @@ For each selected hypothesis:
 1. **Agentic Analyst** — a Claude Code session with Read/Write/Edit/Bash
    tools. The agent inspects the dataset(s) named in the hypothesis,
    writes a Jupyter notebook that tests the claim, runs it via
-   papermill, and iterates on errors. Returns when the notebook runs
-   cleanly or the turn budget is exhausted.
+   papermill, and iterates on errors. The stage requires a successful SDK
+   terminal result and a cleanly executed notebook; turn-budget exhaustion is
+   retained in the trace and fails the analysis.
 
-2. **Methods Critic** — a single-shot reasoning-role call that reviews the
-   analyst's summary + notebook and flags methodological issues. Output
-   is a structured JSON verdict attached to the hypothesis.
+2. **Analyst ⇄ Methods Critic loop** — the reasoning-role critic reviews the
+   analyst's summary and notebook. A `concerns` or `unsound` verdict, or any
+   high-severity issue, sends the critique back through another analyst pass.
+   The bounded loop succeeds only on a `sound` verdict without high-severity
+   issues; each notebook and critique is snapshotted for review.
 
 At startup, Analyze discovers the governor's effective allow-list and verifies
 that its concrete assignments are invokable. The Agent SDK analyst requests the
 logical synthesis role; the methods critic requests the reasoning role. With
-the allow-list used for v0.0.3 validation, both resolve to Sonnet 4.6. A
+the previously observed Pennsieve Test allow-list, both resolved to Sonnet
+4.6. v0.0.5 re-discovers and verifies the current assignments at startup. A
 mid-run `model_not_allowed` or IAM `access_denied` response reroutes and retries
 the direct methods-critic request up to three bounded attempts.
 
@@ -67,6 +69,7 @@ python -m analyze.main
 | `ANTHROPIC_BASE_URL` | _(required)_ | Sidecar URL (`http://localhost:8765` in production) |
 | `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
+| `VP_ANALYZE_MAX_METHODS_ITERS` | `3` | Maximum analyst/critic passes before an unresolved methods review fails the stage |
 | `VP_MODEL_SONNET` | dynamically resolved | Explicit pin for the Agent SDK analyst's model role |
 | `VP_ANALYZE_MODEL` | unset | Backward-compatible alias for `VP_MODEL_SONNET`; conflicting pins fail preflight |
 | `VP_MODEL_OPUS` | dynamically resolved | Explicit pin for the methods critic's reasoning role |
@@ -75,8 +78,8 @@ python -m analyze.main
 ## Pennsieve Test smoke check
 
 Before the analyst starts, a healthy run prints the effective allow-list and
-both concrete assignments. For the allow-list that motivated v0.0.3, the
-important lines are:
+both concrete assignments. In the previously observed Test configuration the
+important lines were:
 
 ```text
 --- LLM preflight ---
@@ -88,8 +91,9 @@ important lines are:
 [llm] → methods_critic logical=opus model=us.anthropic.claude-sonnet-4-6 attempt=1/3 ...
 ```
 
-Successful completion should log `methods_critic: done` followed by
-`analyze: done`. In the output `blackboard.json`, the selected hypothesis from
+Successful completion may include several analyst/critic passes. It logs
+`analyze: done` only after the methods gate passes. In the output
+`blackboard.json`, the selected hypothesis from
 the final Hypothesize iteration must contain non-empty `analysis_workdir` and
 `analysis_summary` fields plus a structured `methods_critique`. Those are the
 handoff fields required by Write.
@@ -103,7 +107,11 @@ Written to `$OUTPUT_DIR`:
   `analysis_tools_called`, `analysis_started_at`/`finished_at`, and
   `methods_critique` fields.
 - `hypotheses/{hypothesis_id}/` — per-hypothesis working directory
-  containing the agent's notebook, data files, intermediate outputs.
+  containing the agent's notebook, data files, intermediate outputs,
+  `agent-events.jsonl`, and paired `analysis.iter{N}.ipynb` /
+  `methods.iter{N}.json` snapshots.
+- `blackboard.{hypothesis_id}.iter{N}.json` — blackboard snapshot after each
+  methods-review pass.
 - `notebook.jsonl` — append-only audit log of every blackboard mutation
   (one event per line).
 - `usage.jsonl` — token-usage records for the non-Claude-Code agent
@@ -126,4 +134,8 @@ stage-namespaced provenance remains deferred to the shared
 
 ## Status
 
-**v0.0.3 candidate — locally validated, not yet tested in Pennsieve compute.**
+**v0.0.5 release candidate — locally validated; Pennsieve Test rerun pending.**
+This candidate restricts analysis to accepted final-round hypotheses, enforces
+successful SDK and notebook completion, and adds a bounded methods-revision
+gate with reviewable traces and snapshots. The rerun will confirm the current
+Bedrock assignments.
