@@ -7,7 +7,8 @@ session with Read/Write/Edit/Bash tools that:
   2. Drafts a Jupyter notebook that tests the claim.
   3. Executes it via papermill.
   4. Fixes errors in-loop.
-  5. Returns when the notebook runs cleanly OR the turn budget is hit.
+  5. Returns only after a successful SDK result and a cleanly executed
+     notebook; turn-budget exhaustion is a stage failure.
 
 Auth model: the Claude Agent SDK reads `ANTHROPIC_BASE_URL` from env
 (set by the platform to `http://localhost:8765` — the in-task sidecar).

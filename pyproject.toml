@@ -1,6 +1,6 @@
 [project]
 name = "pennsieve-ai-analyze"
-version = "0.0.3"
+version = "0.0.5"
 description = "Pennsieve compute-node processor — stage 3 of the pennsieve-ai research pipeline. Agentic analysis: data inspection → notebook generation → execution → methods critique, all in a Claude-Code-driven loop."
 requires-python = ">=3.12"
 dependencies = [
