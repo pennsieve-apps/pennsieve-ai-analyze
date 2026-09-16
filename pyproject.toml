@@ -21,6 +21,7 @@ dependencies = [
     # Notebook execution (papermill drives Jupyter; nbformat for I/O).
     "papermill>=2.6",
     "nbformat>=5.10",
+    "ipykernel>=6.29",
     "jupytext>=1.16",
     # Common analysis stack the agent will reach for. Pre-installed so
     # the agent doesn't burn turns running pip install inside its loop.

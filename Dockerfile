@@ -41,7 +41,9 @@ COPY pyproject.toml ./
 COPY src/ ./src/
 
 RUN pip install --no-cache-dir .
+RUN python -m ipykernel install --sys-prefix --name python3
 
 ENV PYTHONPATH=/app/src
+ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["python", "-m", "analyze.main"]

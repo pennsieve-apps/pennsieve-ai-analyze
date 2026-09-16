@@ -22,6 +22,7 @@ def test_critic_failure_propagates_after_logging(monkeypatch):
         raise RuntimeError("governor unavailable")
 
     monkeypatch.setattr(methods_critic, "call_json", fail_call)
+    monkeypatch.setattr(methods_critic, "_read_notebook_text", lambda h: '{"cells": []}')
 
     with pytest.raises(RuntimeError, match="Methods critique failed"):
         methods_critic.run(bb, object(), hypothesis)

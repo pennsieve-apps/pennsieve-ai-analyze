@@ -12,6 +12,7 @@ a follow-up. For v0 we just produce a free-text critique.
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -20,13 +21,16 @@ from analyze.blackboard import Blackboard, Hypothesis
 from analyze.llm import LLMClient
 
 
-def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis) -> None:
+def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_path: Path | None = None) -> None:
     if not hypothesis.analysis_summary:
         bb.log("methods_critic", "skipped",
                f"hypothesis {hypothesis.id}: no analyst summary to critique")
-        return
+        raise RuntimeError("Methods critic requires an analyst summary")
 
-    notebook_text = _read_notebook_text(hypothesis)
+    notebook_text = notebook_path.read_text() if notebook_path else _read_notebook_text(hypothesis)
+    if not notebook_text:
+        raise RuntimeError("Methods critic requires the executed notebook, not just a summary")
+    notebook_text = _compact_notebook(notebook_text)
 
     system = (
         "You are a methods critic reviewing an automated data analysis. "
@@ -72,6 +76,11 @@ Produce a JSON object with this shape:
             f"Methods critique failed for hypothesis {hypothesis.id}"
         ) from e
 
+    if result.get("verdict") not in {"sound", "concerns", "unsound"} or not isinstance(result.get("issues"), list):
+        raise ValueError("Methods critic returned an invalid verdict or issues list")
+    if any(not isinstance(i, dict) or i.get("severity") not in {"high", "medium", "low"}
+           for i in result["issues"]):
+        raise ValueError("Methods critic returned an invalid issue")
     hypothesis.methods_critique = result
     bb.log("methods_critic", "done",
            f"hypothesis {hypothesis.id}: verdict={result.get('verdict', '?')}, "
@@ -97,3 +106,23 @@ def _read_notebook_text(hypothesis: Hypothesis) -> str:
             except Exception:
                 pass
     return ""
+
+
+def _compact_notebook(raw: str) -> str:
+    """Show sources and outputs instead of spending the context on base64 PNGs."""
+    notebook = json.loads(raw)
+    cells = notebook.get("cells", [])
+    per_cell = max(200, 19000 // max(len(cells), 1))
+    blocks = []
+    for index, cell in enumerate(cells):
+        outputs = []
+        for output in cell.get("outputs", []):
+            text = output.get("text") or output.get("data", {}).get("text/plain", "")
+            if text:
+                outputs.append("".join(text))
+            if output.get("output_type") == "error":
+                outputs.append(f"ERROR: {output.get('ename')}: {output.get('evalue')}")
+        source = "".join(cell.get("source", ""))
+        blocks.append(f"Cell {index} ({cell.get('cell_type')}, execution={cell.get('execution_count')}):\n"
+                      f"{source[:per_cell // 2]}\nOutputs:\n{chr(10).join(outputs)[:per_cell // 2]}")
+    return "\n\n".join(blocks)

@@ -5,33 +5,38 @@ For each hypothesis on the blackboard, run the agentic analyst (writes
 critic (reviews the notebook + outputs and flags failed assumptions /
 weak inferences). Results are recorded back onto the hypothesis.
 
-v0 scope: single pass, top-N hypotheses (configurable via env var,
-default 1). The HypGen ↔ Critic loop is upstream in Hypothesize; here
-we trust the ranking and analyze the highest-ranked candidates.
+Analyze up to N accepted hypotheses (default 1), with a bounded methods
+revision loop. Rejected or unreviewed candidates cannot enter analysis.
 """
 from __future__ import annotations
 
+import json
 import os
+import shutil
 from pathlib import Path
 
+from analyze.agents import agentic_analyst, methods_critic
 from analyze.blackboard import Blackboard
 from analyze.llm import LLMClient
-from analyze.agents import agentic_analyst, methods_critic
 
 
 def _hypotheses_to_analyze(bb: Blackboard) -> list:
     """Pick which hypotheses get analyzed in this run.
 
-    Default: the first hypothesis in Hypothesize's final iteration. Locked
+    Default: the first accepted hypothesis in Hypothesize's final iteration. Locked
     hypotheses keep their IDs across iterations, so selecting from the final
     slate ensures Write later reads the same record that Analyze updates.
     Override the count via `VP_ANALYZE_TOP_N`.
     """
     n = int(os.environ.get("VP_ANALYZE_TOP_N", "1"))
+    if n < 1:
+        raise ValueError("VP_ANALYZE_TOP_N must be at least 1")
     if not bb.hypotheses:
         return []
     final_iteration = bb.iterations_completed or max(h.iteration for h in bb.hypotheses)
-    return list(bb.hypotheses_at(final_iteration))[:n]
+    reviews = {r.hypothesis_id: r for r in bb.reviews_at(final_iteration)}
+    return [h for h in bb.hypotheses_at(final_iteration)
+            if h.id in reviews and reviews[h.id].verdict == "accept"][:n]
 
 
 async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> None:
@@ -39,18 +44,32 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
     the Claude Agent SDK, which is async."""
     targets = _hypotheses_to_analyze(bb)
     if not targets:
-        bb.log("analyze", "no_hypotheses",
-               "blackboard has no hypotheses to analyze — Hypothesize "
-               "produced an empty output; nothing to do.")
-        return
+        message = ("No accepted hypotheses in the final iteration. Review the "
+                   "hypothesis critiques; analysis and manuscript generation are stopped.")
+        bb.log("analyze", "blocked", message)
+        raise RuntimeError(message)
+
+    max_iters = int(os.environ.get("VP_ANALYZE_MAX_METHODS_ITERS", "3"))
+    if max_iters < 1:
+        raise ValueError("VP_ANALYZE_MAX_METHODS_ITERS must be at least 1")
 
     print(f"\n--- agentic analyst (analyzing {len(targets)} hypothesis/es) ---")
     analyst_model = client.resolve_model("sonnet")
     for hyp in targets:
-        await agentic_analyst.run(
-            bb, hyp, workdir=workdir, model_id=analyst_model,
-        )
-
-    print("\n--- methods critic ---")
-    for hyp in targets:
-        methods_critic.run(bb, client, hyp)
+        for iteration in range(1, max_iters + 1):
+            bb.log("analyze", "iteration", f"{hyp.id}: {iteration}/{max_iters}")
+            await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=analyst_model)
+            folder = workdir / "hypotheses" / hyp.id
+            methods_critic.run(bb, client, hyp, notebook_path=folder / "analysis.ipynb")
+            critique = hyp.methods_critique
+            (folder / f"methods.iter{iteration}.json").write_text(json.dumps(critique, indent=2))
+            shutil.copy2(folder / "analysis.ipynb", folder / f"analysis.iter{iteration}.ipynb")
+            bb.save(workdir / f"blackboard.{hyp.id}.iter{iteration}.json")
+            if critique.get("verdict") == "sound" and not any(
+                issue.get("severity") == "high" for issue in critique.get("issues", [])
+            ):
+                break
+            bb.log("analyze", "revision_required", f"{hyp.id}: {json.dumps(critique)}")
+        else:
+            raise RuntimeError(f"{hyp.id}: methods review did not pass after {max_iters} iterations; "
+                               "notebook and critiques retained for review")

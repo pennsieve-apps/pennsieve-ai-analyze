@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -25,7 +26,12 @@ from analyze.llm import LLMClient
 from analyze.pipeline import run_analyze
 
 
+def _terminate(signum, frame):
+    raise KeyboardInterrupt("termination requested")
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _terminate)
     input_dir = Path(os.environ.get("INPUT_DIR", "/mnt/efs/input"))
     output_dir = Path(os.environ.get("OUTPUT_DIR", "/mnt/efs/output"))
     execution_run_id = os.environ.get("EXECUTION_RUN_ID", "local-dev")
@@ -83,6 +89,7 @@ def main() -> int:
     # Non-Claude-Code agents (e.g., the methods critic) still use a plain
     # anthropic.Anthropic client. The Claude Agent SDK in the analyst path
     # is independent — it reads ANTHROPIC_BASE_URL from env directly.
+    bb.save(output_dir / "blackboard.json")
     client = LLMClient()
 
     try:
@@ -95,7 +102,7 @@ def main() -> int:
             ),
         )
         asyncio.run(run_analyze(bb, client, workdir=output_dir))
-    except Exception as e:
+    except (Exception, KeyboardInterrupt) as e:
         bb.log("analyze", "fatal", repr(e))
         _write_outputs(bb, client, output_dir)
         raise
