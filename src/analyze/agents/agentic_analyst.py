@@ -24,10 +24,11 @@ Scaffold-stage notes:
 """
 from __future__ import annotations
 
-import asyncio
+import json
 import os
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from analyze.blackboard import Blackboard, Hypothesis
@@ -47,7 +48,10 @@ async def run(
     """Drive one analyst session against one hypothesis."""
     try:
         from claude_agent_sdk import (
-            ClaudeSDKClient, ClaudeAgentOptions, PermissionResultAllow,
+            ClaudeAgentOptions,
+            ClaudeSDKClient,
+            PermissionResultAllow,
+            PermissionResultDeny,
         )
     except ImportError as e:
         bb.log(
@@ -59,7 +63,9 @@ async def run(
 
     # Per-hypothesis working subdirectory. The Claude Code session runs
     # with this as cwd so any files the agent writes are scoped here.
-    hyp_workdir = workdir / "hypotheses" / hypothesis.id
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", hypothesis.id):
+        raise ValueError("Hypothesis ID must be a safe directory name")
+    hyp_workdir = (workdir / "hypotheses" / hypothesis.id).resolve()
     hyp_workdir.mkdir(parents=True, exist_ok=True)
 
     task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir)
@@ -68,29 +74,43 @@ async def run(
         flush=True,
     )
 
-    # Auto-approve every tool call via the can_use_tool callback. We don't
-    # use permission_mode="bypassPermissions" because that maps to Claude
-    # Code's `--dangerously-skip-permissions` flag, which refuses to run
-    # under root — and our container does run as root (matches the rest of
-    # the pipeline so EFS workdir ownership is consistent across stages).
-    # Safety story: the agent is already sandboxed by the per-execution EFS
-    # workdir + governor budget cap + execution-scoped IAM; the CLI prompt
-    # would just block in a non-interactive container.
+    # Approve the analysis tool set without interactive prompts. Isolation
+    # is supplied by the compute runtime; cwd itself is not a sandbox.
     async def _allow_all(tool_name, tool_input, context):
-        return PermissionResultAllow()
+        if tool_name in {"Read", "Write", "Edit", "Bash", "NotebookEdit"}:
+            return PermissionResultAllow()
+        return PermissionResultDeny(message="Tool is not enabled for this analysis")
 
     options = ClaudeAgentOptions(
         model=model_id,
         max_turns=MAX_TURNS,
-        allowed_tools=["Read", "Write", "Edit", "Bash"],
+        # Broad allowed_tools entries bypass can_use_tool in the SDK.
+        # Leave approval to the callback; cwd is not a security boundary.
         can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
     )
 
-    started = datetime.utcnow().isoformat(timespec="seconds")
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     tools_called: list[str] = []
     total_cost = 0.0
     final_text = ""
+    completed = False
+    trace_path = hyp_workdir / "agent-events.jsonl"
+
+    def event(kind, **fields):
+        record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "hypothesis_id": hypothesis.id, "event": kind, **fields}
+        text = json.dumps(record, default=str)
+        # Remove environment credentials and common inline secrets from traces.
+        for key, value in os.environ.items():
+            if any(word in key.upper() for word in ("SECRET", "TOKEN", "PASSWORD", "API_KEY", "ACCESS_KEY")) and len(value) > 5:
+                text = text.replace(value, "[REDACTED]")
+        text = re.sub(r"(?i)(X-Amz-[^=\s&]+)=([^&\s\"]+)", r"\1=[REDACTED]", text)
+        with trace_path.open("a") as trace:
+            trace.write(text + "\n")
+        return json.loads(text)
+
+    event("start", model=model_id, max_turns=MAX_TURNS)
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -101,13 +121,37 @@ async def run(
                     for block in content:
                         if hasattr(block, "name") and hasattr(block, "input"):
                             tools_called.append(block.name)
-                            print(f"  [agent] tool: {block.name}", flush=True)
+                            safe = event("tool_start", tool=block.name,
+                                         tool_use_id=getattr(block, "id", None), input=block.input)
+                            arguments = safe["input"]
+                            detail = (arguments.get("description") or arguments.get("command") or
+                                      arguments.get("file_path") or arguments.get("notebook_path") or "")
+                            print(f"  [agent] {hypothesis.id} tool #{len(tools_called)}: "
+                                  f"{block.name} id={getattr(block, 'id', '?')} "
+                                  f"{str(detail).replace(chr(10), ' ')[:160]}", flush=True)
+                        elif hasattr(block, "tool_use_id"):
+                            event("tool_result", tool_use_id=block.tool_use_id,
+                                  is_error=getattr(block, "is_error", False),
+                                  content=str(getattr(block, "content", ""))[:8000])
                         elif hasattr(block, "text"):
                             final_text = block.text
                 cost = getattr(msg, "total_cost_usd", None)
                 if cost is not None:
                     total_cost = max(total_cost, float(cost))
+                if hasattr(msg, "is_error"):
+                    event("result", subtype=getattr(msg, "subtype", ""),
+                          is_error=msg.is_error, cost_usd=total_cost,
+                          usage=getattr(msg, "usage", {}))
+                    if msg.is_error or getattr(msg, "subtype", "") != "success":
+                        raise RuntimeError(f"Agent did not complete: {getattr(msg, 'subtype', '?')}")
+                    completed = True
+                    final_text = getattr(msg, "result", None) or final_text
+        if not completed or not final_text.strip():
+            raise RuntimeError("Agent ended without a successful result and summary")
+        validate_notebook(hyp_workdir / "analysis.ipynb")
     except Exception as e:
+        hypothesis.analysis_cost_usd += total_cost
+        hypothesis.analysis_tools_called.extend(tools_called)
         bb.log(
             "agentic_analyst", "error",
             f"hypothesis {hypothesis.id}: agent loop failed: {e!r}",
@@ -118,12 +162,12 @@ async def run(
 
     # Record artifacts on the hypothesis. The Write stage reads these to
     # produce the final report.
-    hypothesis.analysis_workdir = str(hyp_workdir.relative_to(workdir.parent))
+    hypothesis.analysis_workdir = str(hyp_workdir.relative_to(workdir.resolve().parent))
     hypothesis.analysis_summary = final_text[:8000]  # cap to keep blackboard.json sane
-    hypothesis.analysis_cost_usd = total_cost
-    hypothesis.analysis_tools_called = tools_called
+    hypothesis.analysis_cost_usd += total_cost
+    hypothesis.analysis_tools_called.extend(tools_called)
     hypothesis.analysis_started_at = started
-    hypothesis.analysis_finished_at = datetime.utcnow().isoformat(timespec="seconds")
+    hypothesis.analysis_finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     bb.log(
         "agentic_analyst", "done",
@@ -139,6 +183,9 @@ def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) ->
     """
     venv_python = sys.executable
     datasets_block = _format_datasets_brief(bb)
+    revision = ("\n## Required methods revisions\nRevise the existing notebook and re-execute ALL cells.\n"
+                + json.dumps(hypothesis.methods_critique, indent=2)
+                if hypothesis.methods_critique else "")
     return f"""You are running a single analysis to test one hypothesis.
 
 You have Read, Write, Edit, and Bash tools. Use Bash to run Python:
@@ -155,6 +202,7 @@ root privileges; standard `pip install` will fail.
 **Claim to test:** {hypothesis.claim}
 
 **Rationale:** {hypothesis.rationale}
+{revision}
 
 ## Datasets available
 
@@ -167,6 +215,9 @@ root privileges; standard `pip install` will fail.
 2. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
    end-to-end: load → preprocess → analysis → conclusion.
 3. Run it via papermill. Fix errors iteratively.
+   Save the executed output as `analysis.ipynb`; every nonempty code cell
+   must have an execution count. Never substitute synthetic data for the
+   deposit. If the data cannot support the test, report the blocker.
 4. When the notebook runs cleanly, write a short summary of what you
    found and whether the claim is supported, partially supported, or
    not supported by the data. Be honest about assumptions and limits.
@@ -185,5 +236,22 @@ def _format_datasets_brief(bb: Blackboard) -> str:
             f"  - Bucket: {d.bucket_uri or '(none)'}\n"
             f"  - Access: {d.access_type or 'unknown'}\n"
             f"  - {d.description[:300]}"
+            f"\n  - Repository URL: {d.url}"
+            f"\n  - README: {d.readme[:1500]}"
+            f"\n  - File tree: {d.file_tree[:10000]}"
+            f"\n  - Record tables: {json.dumps(d.record_tables)[:3000]}"
         )
     return "\n".join(out)
+
+
+def validate_notebook(path: Path) -> None:
+    """Require actual executed cells; absence of errors alone is insufficient."""
+    import nbformat
+
+    notebook = nbformat.read(path, as_version=4)
+    nbformat.validate(notebook)
+    code = [c for c in notebook.cells if c.cell_type == "code" and c.source.strip()]
+    if not code or any(c.execution_count is None for c in code):
+        raise RuntimeError("analysis.ipynb has no executed code or contains unexecuted cells")
+    if any(o.output_type == "error" for c in code for o in c.outputs):
+        raise RuntimeError("analysis.ipynb contains execution errors")

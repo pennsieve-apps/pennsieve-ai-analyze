@@ -1,8 +1,10 @@
 # pennsieve-ai-analyze
 
+Local hardening update: only accepted final-round hypotheses are selected. `VP_ANALYZE_MAX_METHODS_ITERS` (default 3) bounds analyst/methods revisions with notebook and critique snapshots. SDK completion and executed notebooks are checked, tool events are retained, and the image includes a Jupyter kernel. Docker deployment is still pending.
+
 Stage 3 of the `pennsieve-ai-*` research pipeline. Reads the blackboard
 produced by [`pennsieve-ai-hypothesize`](https://github.com/Pennsieve/pennsieve-ai-hypothesize),
-runs an agentic analysis against the first hypothesis in the final iteration
+runs an agentic analysis against the first accepted hypothesis in the final iteration
 (or first N, configurable), and emits an updated blackboard for the downstream
 Write stage.
 
@@ -63,7 +65,7 @@ python -m analyze.main
 | `WORKFLOW_INSTANCE_ID` | `local-dev` | Platform-injected workflow execution identifier |
 | `LLM_GOVERNOR_FUNCTION_NAME` | _(required)_ | Governor Lambda used for discovery, preflight, and direct critic calls |
 | `ANTHROPIC_BASE_URL` | _(required)_ | Sidecar URL (`http://localhost:8765` in production) |
-| `VP_ANALYZE_TOP_N` | `1` | How many hypotheses from the final iteration to analyze |
+| `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
 | `VP_MODEL_SONNET` | dynamically resolved | Explicit pin for the Agent SDK analyst's model role |
 | `VP_ANALYZE_MODEL` | unset | Backward-compatible alias for `VP_MODEL_SONNET`; conflicting pins fail preflight |
