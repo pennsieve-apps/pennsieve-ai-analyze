@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from analyze.agents import methods_critic
-from analyze.blackboard import Blackboard, Hypothesis
+from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 
 
 def test_critic_failure_propagates_after_logging(monkeypatch):

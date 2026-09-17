@@ -16,8 +16,8 @@ import shutil
 from pathlib import Path
 
 from analyze.agents import agentic_analyst, methods_critic
-from analyze.blackboard import Blackboard
-from analyze.llm import LLMClient
+from pennsieve_ai_utils.blackboard import Blackboard
+from pennsieve_ai_utils.llm import LLMClient
 
 
 def _hypotheses_to_analyze(bb: Blackboard) -> list:

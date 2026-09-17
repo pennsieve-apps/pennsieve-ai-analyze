@@ -15,34 +15,35 @@ auth ourselves — the platform handles it.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import signal
 import sys
-from pathlib import Path
+from dataclasses import replace
 
-from analyze.blackboard import Blackboard
-from analyze.llm import LLMClient
+from pennsieve_ai_utils.llm import LLMClient
+from pennsieve_ai_utils.models import ROLES, ModelNotAvailable
+from pennsieve_ai_utils.processor import (
+    ProcessorEnv,
+    install_sigterm_handler,
+    load_upstream_blackboard,
+    write_outputs,
+)
+
 from analyze.pipeline import run_analyze
 
+STAGE = "analyze"
 
-def _terminate(signum, frame):
-    raise KeyboardInterrupt("termination requested")
+# Analyze predates the shared role names; `VP_ANALYZE_MODEL` pins the analyst
+# (synthesis) model on existing deployments and keeps working as an alias.
+ROLE_TABLE = {
+    **ROLES,
+    "synthesis": replace(ROLES["synthesis"], env_aliases=("VP_ANALYZE_MODEL",)),
+}
 
 
 def main() -> int:
-    signal.signal(signal.SIGTERM, _terminate)
-    input_dir = Path(os.environ.get("INPUT_DIR", "/mnt/efs/input"))
-    output_dir = Path(os.environ.get("OUTPUT_DIR", "/mnt/efs/output"))
-    execution_run_id = os.environ.get("EXECUTION_RUN_ID", "local-dev")
-    workflow_instance_id = os.environ.get("WORKFLOW_INSTANCE_ID", "local-dev")
-
-    print("=== pennsieve-ai-analyze ===")
-    print(f"  INPUT_DIR={input_dir}")
-    print(f"  OUTPUT_DIR={output_dir}")
-    print(f"  EXECUTION_RUN_ID={execution_run_id}")
-    print(f"  WORKFLOW_INSTANCE_ID={workflow_instance_id}")
-    print(f"  ANTHROPIC_BASE_URL={os.environ.get('ANTHROPIC_BASE_URL', '<unset>')}")
+    install_sigterm_handler()
+    env = ProcessorEnv.from_environ()
+    env.banner(STAGE, ANTHROPIC_BASE_URL=os.environ.get("ANTHROPIC_BASE_URL", "<unset>"))
 
     # Sanity-check the platform contract: if ANTHROPIC_BASE_URL isn't set,
     # the Claude Agent SDK would default to api.anthropic.com (with no
@@ -59,25 +60,14 @@ def main() -> int:
         )
         return 2
 
-    bb_path = input_dir / "blackboard.json"
-    if not bb_path.exists():
-        print(
-            f"ERROR: no blackboard.json at {bb_path} — Hypothesize did not "
-            f"produce its expected output, or the workflow wiring is wrong.",
-            file=sys.stderr,
-        )
+    bb = load_upstream_blackboard(env.input_dir / "blackboard.json", stage=STAGE,
+                                  upstream="Hypothesize", run_id=env.execution_run_id)
+    if bb is None:
         return 2
-
+    output_dir = env.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n--- loading blackboard from {bb_path} ---")
-    bb = Blackboard.load(bb_path)
-    bb.run_id = execution_run_id
-    if bb.degraded:
-        stages = ", ".join(sorted({d.get("stage", "?") for d in bb.degraded}))
-        print(f"  WARNING: upstream blackboard is degraded — skipped/failed stages: {stages}")
-        bb.log("analyze", "upstream_degraded", stages)
-    bb.log("analyze", "start",
+    bb.log(STAGE, "start",
            f"loaded blackboard: {len(bb.dataset_summaries)} datasets, "
            f"{len(bb.hypotheses)} hypotheses, "
            f"{len(bb.literature_claims)} literature claims")
@@ -85,41 +75,36 @@ def main() -> int:
     print(f"  hypotheses: {len(bb.hypotheses)} | "
           f"datasets: {len(bb.dataset_summaries)} | "
           f"literature claims: {len(bb.literature_claims)}")
-
-    # Non-Claude-Code agents (e.g., the methods critic) still use a plain
-    # anthropic.Anthropic client. The Claude Agent SDK in the analyst path
-    # is independent — it reads ANTHROPIC_BASE_URL from env directly.
     bb.save(output_dir / "blackboard.json")
-    client = LLMClient()
+
+    # Non-Claude-Code agents (the methods critic) use the governor client
+    # directly. The Claude Agent SDK in the analyst path is independent — it
+    # reads ANTHROPIC_BASE_URL from env — but takes its model ID from the same
+    # preflighted assignment (`synthesis`).
+    client = LLMClient(stage=STAGE, roles=("reasoning", "synthesis"), role_table=ROLE_TABLE)
+    try:
+        assignments = client.preflight()
+    except ModelNotAvailable as e:
+        bb.log(STAGE, "fatal", f"model preflight failed: {e}")
+        write_outputs(bb, output_dir, client.usage_log)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 5
+    for role, assignment in assignments.items():
+        bb.record_model_assignment(stage=STAGE, role=role, assignment=assignment)
+    bb.log(STAGE, "models",
+           ", ".join(f"{role}={a['model_id']}" for role, a in sorted(assignments.items())))
 
     try:
-        bb.model_assignments = client.preflight()
-        bb.log(
-            "analyze", "models",
-            ", ".join(
-                f"{logical}={assignment['model_id']}"
-                for logical, assignment in sorted(bb.model_assignments.items())
-            ),
-        )
         asyncio.run(run_analyze(bb, client, workdir=output_dir))
     except (Exception, KeyboardInterrupt) as e:
-        bb.log("analyze", "fatal", repr(e))
-        _write_outputs(bb, client, output_dir)
+        bb.log(STAGE, "fatal", repr(e))
+        write_outputs(bb, output_dir, client.usage_log)
         raise
 
-    bb.log("analyze", "done", "")
-    _write_outputs(bb, client, output_dir)
+    bb.log(STAGE, "done", "")
+    write_outputs(bb, output_dir, client.usage_log)
     print(f"\nWrote: {output_dir / 'blackboard.json'}")
     return 0
-
-
-def _write_outputs(bb: Blackboard, client: LLMClient, output_dir: Path) -> None:
-    """Persist blackboard + audit logs to OUTPUT_DIR for the Write stage."""
-    bb.save(output_dir / "blackboard.json")
-    nb = "\n".join(json.dumps(e) for e in bb.notebook)
-    (output_dir / "notebook.jsonl").write_text(nb + "\n" if nb else "")
-    ul = "\n".join(json.dumps(e) for e in client.usage_log)
-    (output_dir / "usage.jsonl").write_text(ul + "\n" if ul else "")
 
 
 if __name__ == "__main__":

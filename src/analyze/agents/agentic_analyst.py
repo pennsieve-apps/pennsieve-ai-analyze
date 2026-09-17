@@ -32,7 +32,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from analyze.blackboard import Blackboard, Hypothesis
+from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 
 # Maximum agent turns. Generous so the agent has room to iterate on
 # real-world data quirks; the agent should self-terminate well before.

@@ -126,11 +126,10 @@ stage instead of being reported as `analyze: done`.
 
 Hypothesize keeps one hypothesis record per iteration, including locked copies
 with the same ID. Analyze deliberately updates the final-iteration record so
-Write's latest-iteration selection reads the same object. Upstream `degraded`
-and `model_assignments` fields survive loading; this release then records
-Analyze's stage-local assignments in `model_assignments`. Cumulative,
-stage-namespaced provenance remains deferred to the shared
-`pennsieve-ai-core` blackboard contract.
+Write's latest-iteration selection reads the same object. The shared
+`pennsieve-ai-utils` contract provides schema migrations and preserves unknown
+fields. Analyze retains upstream model provenance and records its assignments
+under the `analyze` stage namespace.
 
 ## Status
 

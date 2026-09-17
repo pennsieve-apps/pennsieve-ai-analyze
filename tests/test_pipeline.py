@@ -4,7 +4,7 @@ import asyncio
 import pytest
 
 from analyze import pipeline
-from analyze.blackboard import Blackboard, Hypothesis, CriticReview
+from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis, CriticReview
 
 
 def _review(iteration, verdict="accept"):

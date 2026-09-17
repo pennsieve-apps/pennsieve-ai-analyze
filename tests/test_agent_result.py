@@ -6,7 +6,7 @@ import nbformat
 import pytest
 
 from analyze.agents import agentic_analyst
-from analyze.blackboard import Blackboard, Hypothesis
+from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 
 
 @pytest.mark.parametrize("subtype,notebook,passes", [("success", True, True), ("error_max_turns", True, False), ("success", False, False)])

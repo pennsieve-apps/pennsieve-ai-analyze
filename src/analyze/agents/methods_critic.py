@@ -17,8 +17,8 @@ import os
 from pathlib import Path
 
 from analyze.agents._common import call_json
-from analyze.blackboard import Blackboard, Hypothesis
-from analyze.llm import LLMClient
+from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
+from pennsieve_ai_utils.llm import LLMClient
 
 
 def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_path: Path | None = None) -> None:
