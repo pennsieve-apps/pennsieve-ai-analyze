@@ -27,7 +27,7 @@ At startup, Analyze discovers the governor's effective allow-list and verifies
 that its concrete assignments are invokable. The Agent SDK analyst requests the
 logical synthesis role; the methods critic requests the reasoning role. With
 the previously observed Pennsieve Test allow-list, both resolved to Sonnet
-4.6. v0.0.5 re-discovers and verifies the current assignments at startup. A
+4.6. v0.0.6 re-discovers and verifies the current assignments at startup. A
 mid-run `model_not_allowed` or IAM `access_denied` response reroutes and retries
 the direct methods-critic request up to three bounded attempts.
 
@@ -134,8 +134,9 @@ stage-namespaced provenance remains deferred to the shared
 
 ## Status
 
-**v0.0.5 release candidate — locally validated; Pennsieve Test rerun pending.**
+**v0.0.6 release candidate — locally validated; Pennsieve Test rerun pending.**
 This candidate restricts analysis to accepted final-round hypotheses, enforces
 successful SDK and notebook completion, and adds a bounded methods-revision
-gate with reviewable traces and snapshots. The rerun will confirm the current
-Bedrock assignments.
+gate with reviewable traces and snapshots. It requires the Anthropic
+1.x-compatible Governor transport from `pennsieve-llm` 0.6.1. The rerun will
+confirm the current Bedrock assignments.
