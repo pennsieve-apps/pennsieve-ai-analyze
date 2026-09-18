@@ -86,7 +86,7 @@ def main() -> int:
         assignments = client.preflight()
     except ModelNotAvailable as e:
         bb.log(STAGE, "fatal", f"model preflight failed: {e}")
-        write_outputs(bb, output_dir, client.usage_log)
+        write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
         print(f"ERROR: {e}", file=sys.stderr)
         return 5
     for role, assignment in assignments.items():
@@ -98,11 +98,11 @@ def main() -> int:
         asyncio.run(run_analyze(bb, client, workdir=output_dir))
     except (Exception, KeyboardInterrupt) as e:
         bb.log(STAGE, "fatal", repr(e))
-        write_outputs(bb, output_dir, client.usage_log)
+        write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
         raise
 
     bb.log(STAGE, "done", "")
-    write_outputs(bb, output_dir, client.usage_log)
+    write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
     print(f"\nWrote: {output_dir / 'blackboard.json'}")
     return 0
 
