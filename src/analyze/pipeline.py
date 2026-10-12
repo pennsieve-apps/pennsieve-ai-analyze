@@ -55,10 +55,15 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
 
     print(f"\n--- agentic analyst (analyzing {len(targets)} hypothesis/es) ---")
     analyst_model = client.resolve_model("sonnet")
+    # Claude Code's background calls need a model this account can invoke
+    # when it talks to Bedrock or the Anthropic API directly.
+    background_model = ("" if getattr(client, "backend", "governor") == "governor"
+                        else client.resolve_model("bulk"))
     for hyp in targets:
         for iteration in range(1, max_iters + 1):
             bb.log("analyze", "iteration", f"{hyp.id}: {iteration}/{max_iters}")
-            await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=analyst_model)
+            await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=analyst_model,
+                                      background_model=background_model)
             folder = workdir / "hypotheses" / hyp.id
             methods_critic.run(bb, client, hyp, notebook_path=folder / "analysis.ipynb")
             critique = hyp.methods_critique

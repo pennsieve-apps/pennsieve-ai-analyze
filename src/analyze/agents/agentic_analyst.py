@@ -10,10 +10,14 @@ session with Read/Write/Edit/Bash tools that:
   5. Returns only after a successful SDK result and a cleanly executed
      notebook; turn-budget exhaustion is a stage failure.
 
-Auth model: the Claude Agent SDK reads `ANTHROPIC_BASE_URL` from env
-(set by the platform to `http://localhost:8765` — the in-task sidecar).
-The sidecar bridges to the LLM governor via `lambda:InvokeWithResponseStream`.
-We don't configure auth here.
+Auth model: the Agent SDK starts the Claude Code CLI inside this container.
+It never uses anyone's Claude subscription or login; it authenticates only
+from environment variables. On the platform (`VP_LLM_BACKEND=governor`) it
+reads `ANTHROPIC_BASE_URL`, set by the platform to `http://localhost:8765`, the
+in-task sidecar that bridges to the LLM governor via
+`lambda:InvokeWithResponseStream`. For local runs, `VP_LLM_BACKEND=bedrock`
+switches it to Bedrock with the caller's AWS credentials, and `anthropic` to
+the Anthropic API with `ANTHROPIC_API_KEY` (see `pennsieve_ai_utils.backend`).
 
 Scaffold-stage notes:
   - The full prototype in `virtual-postdoc` carries SPARC-specific dataset
@@ -32,11 +36,17 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pennsieve_ai_utils.backend import claude_code_env
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
+from pennsieve_ai_utils.llm import raw_io_enabled
 
 # Maximum agent turns. Generous so the agent has room to iterate on
 # real-world data quirks; the agent should self-terminate well before.
 MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
+
+# Tool results are cut to this many characters in the trace, unless
+# VP_LOG_LLM_IO=1 asks for the full transcript.
+TRACE_RESULT_CHARS = 8000
 
 
 async def run(
@@ -45,8 +55,13 @@ async def run(
     *,
     workdir: Path,
     model_id: str,
+    background_model: str = "",
 ) -> None:
-    """Drive one analyst session against one hypothesis."""
+    """Drive one analyst session against one hypothesis.
+
+    `background_model` serves Claude Code's own small background calls on a
+    direct backend; the governor path leaves that to the platform.
+    """
     try:
         from claude_agent_sdk import (
             ClaudeAgentOptions,
@@ -89,6 +104,7 @@ async def run(
         # Leave approval to the callback; cwd is not a security boundary.
         can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
+        env=claude_code_env(background_model),
     )
 
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -111,7 +127,12 @@ async def run(
             trace.write(text + "\n")
         return json.loads(text)
 
-    event("start", model=model_id, max_turns=MAX_TURNS)
+    # With VP_LOG_LLM_IO=1 the trace is a full transcript: the task prompt,
+    # every text and thinking block, untruncated tool results, and per-turn
+    # usage. Claude Code's own system prompt is not exposed by the SDK.
+    raw = raw_io_enabled()
+    event("start", model=model_id, max_turns=MAX_TURNS,
+          **({"prompt": task_prompt} if raw else {}))
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -131,11 +152,20 @@ async def run(
                                   f"{block.name} id={getattr(block, 'id', '?')} "
                                   f"{str(detail).replace(chr(10), ' ')[:160]}", flush=True)
                         elif hasattr(block, "tool_use_id"):
+                            result = str(getattr(block, "content", ""))
                             event("tool_result", tool_use_id=block.tool_use_id,
                                   is_error=getattr(block, "is_error", False),
-                                  content=str(getattr(block, "content", ""))[:8000])
+                                  content=result if raw else result[:TRACE_RESULT_CHARS])
+                        elif hasattr(block, "thinking"):
+                            if raw:
+                                event("thinking", text=block.thinking)
                         elif hasattr(block, "text"):
                             final_text = block.text
+                            if raw:
+                                event("text", text=block.text)
+                usage = getattr(msg, "usage", None)
+                if raw and usage and not hasattr(msg, "is_error"):
+                    event("turn_usage", model=getattr(msg, "model", None), usage=usage)
                 cost = getattr(msg, "total_cost_usd", None)
                 if cost is not None:
                     total_cost = max(total_cost, float(cost))

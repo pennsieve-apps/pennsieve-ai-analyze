@@ -34,10 +34,12 @@ def test_analyze_targets_final_iteration_hypothesis(monkeypatch, tmp_path):
         critic_reviews=[_review(3)],
     )
     analyst_calls = []
+    background_models = []
     critic_calls = []
 
-    async def fake_analyst(bb, hypothesis, *, workdir, model_id):
+    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model=""):
         analyst_calls.append((hypothesis, workdir, model_id))
+        background_models.append(background_model)
         hypothesis.analysis_workdir = "hypotheses/H1"
         hypothesis.analysis_summary = "complete"
         folder = workdir / "hypotheses" / hypothesis.id
@@ -58,6 +60,8 @@ def test_analyze_targets_final_iteration_hypothesis(monkeypatch, tmp_path):
     asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
 
     assert analyst_calls == [(final, tmp_path, "us.anthropic.claude-sonnet-4-6")]
+    # The governor path leaves Claude Code's background model to the platform.
+    assert background_models == [""]
     assert critic_calls == [final]
     assert first.analysis_summary == ""
     assert final.analysis_summary == "complete"
@@ -88,7 +92,7 @@ def test_methods_revision_loop_is_bounded_and_snapshotted(monkeypatch, tmp_path,
     h = _hypothesis(1)
     bb = Blackboard("q", "dataset", hypotheses=[h], critic_reviews=[_review(1)])
     seen = []
-    async def analyst(bb, hyp, *, workdir, model_id):
+    async def analyst(bb, hyp, *, workdir, model_id, background_model=""):
         seen.append(dict(hyp.methods_critique))
         folder = workdir / "hypotheses" / hyp.id
         folder.mkdir(parents=True, exist_ok=True)
@@ -106,3 +110,30 @@ def test_methods_revision_loop_is_bounded_and_snapshotted(monkeypatch, tmp_path,
     assert len(seen) == 2 and seen[1]["verdict"] == "concerns"
     assert (tmp_path / "hypotheses/H1/analysis.iter1.ipynb").read_text() == "1"
     assert (tmp_path / "hypotheses/H1/analysis.iter2.ipynb").read_text() == "2"
+
+
+def test_direct_backend_passes_a_background_model(monkeypatch, tmp_path):
+    hyp = _hypothesis(1)
+    bb = Blackboard(research_question="question", subsystem="pennsieve:530",
+                    iterations_completed=1, hypotheses=[hyp], critic_reviews=[_review(1)])
+    seen = []
+
+    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model=""):
+        seen.append(background_model)
+        folder = workdir / "hypotheses" / hypothesis.id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "analysis.ipynb").write_text("{}")
+
+    def fake_critic(bb, client, hypothesis, **kwargs):
+        hypothesis.methods_critique = {"verdict": "sound", "issues": []}
+
+    monkeypatch.setattr(pipeline.agentic_analyst, "run", fake_analyst)
+    monkeypatch.setattr(pipeline.methods_critic, "run", fake_critic)
+    models = {"sonnet": "us.anthropic.claude-sonnet-5-5",
+              "bulk": "us.anthropic.claude-haiku-4-5-20251001-v1:0"}
+    client = type("Client", (), {"backend": "bedrock",
+                                 "resolve_model": lambda self, role: models[role]})()
+
+    asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+
+    assert seen == ["us.anthropic.claude-haiku-4-5-20251001-v1:0"]
