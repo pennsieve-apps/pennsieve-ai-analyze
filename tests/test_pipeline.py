@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pytest
 
 from analyze import pipeline
@@ -105,7 +106,7 @@ def test_methods_revision_loop_is_bounded_and_snapshotted(monkeypatch, tmp_path,
     if pass_second:
         asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
     else:
-        with pytest.raises(RuntimeError, match="did not pass"):
+        with pytest.raises(pipeline.ReviewUnresolved, match="did not pass the analysis"):
             asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
     assert len(seen) == 2 and seen[1]["verdict"] == "concerns"
     assert (tmp_path / "hypotheses/H1/analysis.iter1.ipynb").read_text() == "1"
@@ -174,12 +175,43 @@ def test_only_data_limits_stop_the_loop_as_not_testable(monkeypatch, tmp_path):
 
 
 def test_a_fixable_high_issue_keeps_the_loop_going(monkeypatch, tmp_path):
+    """A data limit beside a fixable issue still gets its revisions, and once the
+    rounds run out the data limit is the reason the analysis did not pass."""
     issues = [{"severity": "high", "kind": "data_limit", "description": "no replicates"},
               {"severity": "high", "kind": "fixable", "description": "uncompensated channels"}]
     bb, h, rounds, client = _loop(monkeypatch, tmp_path, issues)
-    with pytest.raises(RuntimeError, match="did not pass after 3"):
+    with pytest.raises(pipeline.NotTestableStage, match="no replicates"):
         asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
-    assert len(rounds) == 3 and "outcome" not in h.methods_critique
+    assert len(rounds) == 3, "the fixable issue gets every round it is owed"
+    assert h.methods_critique["outcome"] == "not_testable"
+    # The reason names the data limit, not the issue a revision could have fixed.
+    assert "uncompensated" not in (tmp_path / "hypotheses/H1/not_testable.json").read_text()
+
+
+def test_a_review_that_never_passes_is_recorded_not_raised(monkeypatch, tmp_path):
+    """Running out of rounds with only fixable issues is a reported outcome.
+
+    It used to raise a bare RuntimeError, which threw away three rounds of real
+    work behind a traceback and told Write nothing.
+    """
+    issues = [{"severity": "high", "kind": "fixable", "description": "uncompensated channels"}]
+    bb, h, rounds, client = _loop(monkeypatch, tmp_path, issues)
+    with pytest.raises(pipeline.ReviewUnresolved, match="uncompensated channels"):
+        asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    assert len(rounds) == 3
+    assert h.methods_critique["outcome"] == "unresolved"
+    recorded = json.loads((tmp_path / "hypotheses/H1/unresolved.json").read_text())
+    assert recorded["outcome"] == "unresolved" and "uncompensated" in recorded["reason"]
+
+
+def test_an_unresolved_review_is_not_a_pass(monkeypatch, tmp_path):
+    """The hypothesis must not look analyzed to the supervisor's gate."""
+    issues = [{"severity": "high", "kind": "fixable", "description": "uncompensated channels"}]
+    bb, h, rounds, client = _loop(monkeypatch, tmp_path, issues)
+    with pytest.raises(pipeline.ReviewUnresolved):
+        asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    assert h.methods_critique["verdict"] != "sound"
+    assert any(i["severity"] == "high" for i in h.methods_critique["issues"])
 
 
 def test_the_analyst_reporting_not_testable_skips_the_critic(monkeypatch, tmp_path):

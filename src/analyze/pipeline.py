@@ -61,6 +61,7 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
                         else client.resolve_model("bulk"))
     passed: list[str] = []
     not_testable: dict[str, str] = {}
+    unresolved: dict[str, str] = {}
     for hyp in targets:
         for iteration in range(1, max_iters + 1):
             bb.log("analyze", "iteration", f"{hyp.id}: {iteration}/{max_iters}")
@@ -70,7 +71,8 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
                                           background_model=background_model,
                                           usage_log=getattr(client, "usage_log", None))
             except agentic_analyst.NotTestable as exc:
-                _record_not_testable(bb, hyp, folder, f"the analyst found: {exc}", not_testable)
+                _record_outcome(bb, hyp, folder, "not_testable",
+                                f"the analyst found: {exc}", not_testable)
                 break
             methods_critic.run(bb, client, hyp, notebook_path=folder / "analysis.ipynb")
             critique = hyp.methods_critique
@@ -81,16 +83,31 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
             if critique.get("verdict") == "sound" and not high:
                 passed.append(hyp.id)
                 break
-            if high and all(i.get("kind") == "data_limit" for i in high):
-                # No revision of the analysis can fix these, so another round would
-                # only repeat them. Record the honest outcome and stop.
+            limits = [i for i in high if i.get("kind") == "data_limit"]
+            last_round = iteration == max_iters
+            if limits and (last_round or len(limits) == len(high)):
+                # No revision of the analysis can fix a data limit. Before the
+                # last round the loop only stops when every high-severity issue
+                # is one, so a fixable issue still gets its revision. On the last
+                # round there are no revisions left, so a remaining data limit is
+                # the binding reason the analysis did not pass.
+                reasons = "; ".join(i.get("description", "") for i in limits)
+                _record_outcome(bb, hyp, folder, "not_testable",
+                                f"the methods critic found: {reasons}", not_testable)
+                break
+            if last_round:
+                # The review never passed, but the rounds happened and the
+                # notebooks are real. That is a result to report, not a crash:
+                # the stage still does not pass, so Write builds nothing on it.
                 reasons = "; ".join(i.get("description", "") for i in high)
-                _record_not_testable(bb, hyp, folder, f"the methods critic found: {reasons}", not_testable)
+                detail = (f"still found: {reasons}" if reasons else
+                          f"did not pass the analysis (verdict: {critique.get('verdict', 'unknown')})")
+                _record_outcome(bb, hyp, folder, "unresolved",
+                                f"after {max_iters} rounds the methods critic {detail}", unresolved)
                 break
             bb.log("analyze", "revision_required", f"{hyp.id}: {json.dumps(critique)}")
-        else:
-            raise RuntimeError(f"{hyp.id}: methods review did not pass after {max_iters} iterations; "
-                               "notebook and critiques retained for review")
+    if not passed and unresolved:
+        raise ReviewUnresolved(unresolved, not_testable)
     if not passed and not_testable:
         raise NotTestableStage(not_testable)
 
@@ -104,11 +121,30 @@ class NotTestableStage(RuntimeError):
         super().__init__("; ".join(f"{h} is not testable with this deposit: {r}" for h, r in reasons.items()))
 
 
-def _record_not_testable(bb: Blackboard, hyp, folder: Path, reason: str, out: dict[str, str]) -> None:
+class ReviewUnresolved(RuntimeError):
+    """No analyzed hypothesis passed its methods review within the rounds
+    allowed. The stage stops, without a manuscript, and says what was left.
+
+    This is the honest end of a review that ran out of rounds. It used to be a
+    bare `RuntimeError` raised from the loop, which threw away three rounds of
+    real work behind a traceback and told Write nothing.
+    """
+
+    def __init__(self, unresolved: dict[str, str], not_testable: dict[str, str] | None = None) -> None:
+        self.unresolved = unresolved
+        self.not_testable = not_testable or {}
+        parts = [f"{h}: {r}" for h, r in unresolved.items()]
+        parts += [f"{h} is not testable with this deposit: {r}" for h, r in self.not_testable.items()]
+        super().__init__("; ".join(parts))
+
+
+def _record_outcome(bb: Blackboard, hyp, folder: Path, outcome: str, reason: str,
+                    out: dict[str, str]) -> None:
     critique = dict(hyp.methods_critique or {})
-    critique.update(outcome="not_testable", not_testable_reason=reason)
+    critique.update(outcome=outcome, not_testable_reason=reason)
     hyp.methods_critique = critique
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "not_testable.json").write_text(json.dumps({"hypothesis_id": hyp.id, "reason": reason}, indent=2))
-    bb.log("analyze", "not_testable", f"{hyp.id}: {reason}")
+    (folder / f"{outcome}.json").write_text(
+        json.dumps({"hypothesis_id": hyp.id, "outcome": outcome, "reason": reason}, indent=2))
+    bb.log("analyze", outcome, f"{hyp.id}: {reason}")
     out[hyp.id] = reason

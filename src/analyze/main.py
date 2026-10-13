@@ -30,7 +30,7 @@ from pennsieve_ai_utils.processor import (
     write_outputs,
 )
 
-from analyze.pipeline import NotTestableStage, run_analyze
+from analyze.pipeline import NotTestableStage, ReviewUnresolved, run_analyze
 
 STAGE = "analyze"
 
@@ -115,6 +115,17 @@ def main() -> int:
         for hyp_id, reason in e.reasons.items():
             print(f"\n{hyp_id} is not testable with this deposit.\n  {reason}", flush=True)
         return 7
+    except ReviewUnresolved as e:
+        # Also an honest result: the rounds ran, the notebooks are real, and the
+        # methods review still did not pass. Outputs are kept and the stage does
+        # not pass, so Write does not build a manuscript on it.
+        bb.log(STAGE, "unresolved", str(e))
+        write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
+        for hyp_id, reason in e.unresolved.items():
+            print(f"\n{hyp_id}: the methods review did not pass after every round.\n  {reason}", flush=True)
+        for hyp_id, reason in e.not_testable.items():
+            print(f"\n{hyp_id} is not testable with this deposit.\n  {reason}", flush=True)
+        return 8
     except (Exception, KeyboardInterrupt) as e:
         bb.log(STAGE, "fatal", repr(e))
         write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
