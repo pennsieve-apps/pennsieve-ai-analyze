@@ -63,7 +63,8 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
         for iteration in range(1, max_iters + 1):
             bb.log("analyze", "iteration", f"{hyp.id}: {iteration}/{max_iters}")
             await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=analyst_model,
-                                      background_model=background_model)
+                                      background_model=background_model,
+                                      usage_log=getattr(client, "usage_log", None))
             folder = workdir / "hypotheses" / hyp.id
             methods_critic.run(bb, client, hyp, notebook_path=folder / "analysis.ipynb")
             critique = hyp.methods_critique

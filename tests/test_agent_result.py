@@ -68,3 +68,31 @@ def test_raw_io_trace_keeps_the_full_transcript(monkeypatch, tmp_path):
     assert kinds == ["start", "thinking", "text", "turn_usage", "tool_result", "result"]
     assert "claim" in rows[0]["prompt"]
     assert rows[4]["content"] == long_output
+
+
+def test_analyst_tokens_are_added_to_the_usage_log(monkeypatch, tmp_path):
+    class Client:
+        def __init__(self, options):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            cell = nbformat.v4.new_code_cell("print(1)", execution_count=1)
+            nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "hypotheses/H1/analysis.ipynb")
+        async def receive_response(self):
+            yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.5, result="done",
+                                  num_turns=7, usage={"input_tokens": 10, "output_tokens": 20,
+                                                      "cache_read_input_tokens": 300,
+                                                      "cache_creation_input_tokens": 40})
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    usage = []
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="m", usage_log=usage))
+    row = usage[-1]
+    assert row["event"] == "agent_sdk_result" and row["hypothesis_id"] == "H1" and row["turns"] == 7
+    assert (row["input_tokens"], row["output_tokens"]) == (10, 20)
+    assert (row["cache_read_input_tokens"], row["cache_creation_input_tokens"]) == (300, 40)
+    assert row["sdk_reported_cost_usd"] == 0.5 and "cost_usd" not in row

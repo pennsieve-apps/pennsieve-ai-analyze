@@ -37,7 +37,7 @@ def test_analyze_targets_final_iteration_hypothesis(monkeypatch, tmp_path):
     background_models = []
     critic_calls = []
 
-    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model=""):
+    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model="", usage_log=None):
         analyst_calls.append((hypothesis, workdir, model_id))
         background_models.append(background_model)
         hypothesis.analysis_workdir = "hypotheses/H1"
@@ -92,7 +92,7 @@ def test_methods_revision_loop_is_bounded_and_snapshotted(monkeypatch, tmp_path,
     h = _hypothesis(1)
     bb = Blackboard("q", "dataset", hypotheses=[h], critic_reviews=[_review(1)])
     seen = []
-    async def analyst(bb, hyp, *, workdir, model_id, background_model=""):
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
         seen.append(dict(hyp.methods_critique))
         folder = workdir / "hypotheses" / hyp.id
         folder.mkdir(parents=True, exist_ok=True)
@@ -118,7 +118,7 @@ def test_direct_backend_passes_a_background_model(monkeypatch, tmp_path):
                     iterations_completed=1, hypotheses=[hyp], critic_reviews=[_review(1)])
     seen = []
 
-    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model=""):
+    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model="", usage_log=None):
         seen.append(background_model)
         folder = workdir / "hypotheses" / hypothesis.id
         folder.mkdir(parents=True, exist_ok=True)

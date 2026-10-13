@@ -36,7 +36,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pennsieve_ai_utils.backend import claude_code_env
+from pennsieve_ai_utils.backend import claude_code_env, llm_backend
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 from pennsieve_ai_utils.llm import raw_io_enabled
 
@@ -56,11 +56,14 @@ async def run(
     workdir: Path,
     model_id: str,
     background_model: str = "",
+    usage_log: list[dict] | None = None,
 ) -> None:
     """Drive one analyst session against one hypothesis.
 
     `background_model` serves Claude Code's own small background calls on a
     direct backend; the governor path leaves that to the platform.
+    `usage_log` is the stage's usage list (`LLMClient.usage_log`); the
+    session's token counts are added to it as one `agent_sdk_result` row.
     """
     try:
         from claude_agent_sdk import (
@@ -173,6 +176,9 @@ async def run(
                     event("result", subtype=getattr(msg, "subtype", ""),
                           is_error=msg.is_error, cost_usd=total_cost,
                           usage=getattr(msg, "usage", {}))
+                    _record_sdk_usage(usage_log, hypothesis.id, model_id,
+                                      getattr(msg, "usage", None) or {}, total_cost,
+                                      len(tools_called), getattr(msg, "num_turns", None))
                     if msg.is_error or getattr(msg, "subtype", "") != "success":
                         raise RuntimeError(f"Agent did not complete: {getattr(msg, 'subtype', '?')}")
                     completed = True
@@ -207,6 +213,40 @@ async def run(
     )
 
 
+def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, tools, turns) -> None:
+    """Add the analyst session's token counts to the stage usage log.
+
+    The Agent SDK reports the session's total usage on its result message.
+    Only token counts are stored, under the same field names as the other
+    usage rows, so cost can be worked out later from a price table. The SDK's
+    own `total_cost_usd` comes from Claude Code's built-in Anthropic list
+    prices, not Bedrock's; it is kept, labeled as the SDK's figure, so the two
+    can be compared.
+    """
+    if usage_log is None:
+        return
+
+    def count(key):
+        value = sdk_usage.get(key) if isinstance(sdk_usage, dict) else getattr(sdk_usage, key, 0)
+        return int(value or 0)
+
+    usage_log.append({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event": "agent_sdk_result",
+        "agent": "agentic_analyst",
+        "hypothesis_id": hypothesis_id,
+        "backend": llm_backend(),
+        "model_id": model_id,
+        "input_tokens": count("input_tokens"),
+        "output_tokens": count("output_tokens"),
+        "cache_creation_input_tokens": count("cache_creation_input_tokens"),
+        "cache_read_input_tokens": count("cache_read_input_tokens"),
+        "tools_called": tools,
+        "turns": turns,
+        "sdk_reported_cost_usd": float(sdk_cost),
+    })
+
+
 def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) -> str:
     """Render the initial task prompt the analyst receives. Kept minimal in
     the scaffold; the prototype version is far richer (per-dataset blocks,
@@ -221,10 +261,14 @@ def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) ->
 
 You have Read, Write, Edit, and Bash tools. Use Bash to run Python:
 `{venv_python}` has pandas, scipy, statsmodels, matplotlib, papermill,
-nbformat, jupytext, httpx, and openpyxl pre-installed.
+nbformat, jupytext, httpx, openpyxl and flowio pre-installed. Use flowio to
+read FCS files. Its `text` dictionary includes the `$SPILL` matrix; apply it
+to compensate the fluorescence channels before gating.
 
 If you need a package that's not pre-installed (e.g., `lifelines`,
 `pynwb`, `nibabel`), install it with `pip install --user <package>`.
+Do not install anything that upgrades or downgrades numpy, pandas or scipy;
+other cells and the methods review depend on the installed versions.
 The `--user` flag is required because this container runs without
 root privileges; standard `pip install` will fail.
 
