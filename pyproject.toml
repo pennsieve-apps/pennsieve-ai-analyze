@@ -10,7 +10,9 @@ dependencies = [
     # pointing at the localhost sidecar (http://localhost:8765), so the
     # SDK's HTTP calls land at the in-task proxy and get bridged to the
     # governor via lambda:Invoke. No public API endpoints involved.
-    "claude-agent-sdk>=0.2",
+    # Pinned so every build runs the same Claude Code version. This SDK
+    # release includes Claude Code 2.1.294.
+    "claude-agent-sdk==0.2.165",
 
     # pennsieve-llm — governor transport for model discovery, preflight,
     # and the direct methods-critic Messages API call. Pulls in anthropic,
