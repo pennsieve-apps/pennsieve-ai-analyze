@@ -203,6 +203,13 @@ async def run(
             raise RuntimeError("Agent ended without a successful result and summary")
         validate_notebook(hyp_workdir / "analysis.ipynb")
         check_analysis_status(hyp_workdir)
+    except NotTestable as e:
+        hypothesis.analysis_cost_usd += total_cost
+        hypothesis.analysis_tools_called.extend(tools_called)
+        hypothesis.analysis_workdir = str(hyp_workdir.relative_to(workdir.resolve().parent))
+        hypothesis.analysis_summary = final_text[:8000]
+        bb.log("agentic_analyst", "not_testable", f"hypothesis {hypothesis.id}: {e}")
+        raise
     except Exception as e:
         hypothesis.analysis_cost_usd += total_cost
         hypothesis.analysis_tools_called.extend(tools_called)
@@ -308,8 +315,17 @@ root privileges; standard `pip install` will fail.
 
 ## Your task
 
-1. Inspect the dataset(s) named in the hypothesis. Look at actual columns,
-   dtypes, NaN rates — do NOT assume schema from the title alone.
+1. Check that the deposit can test the claim before analyzing anything. Find
+   the folders that hold the claim's outcome measurement and confirm they
+   measure it directly, for the samples, conditions and replicates the claim
+   needs. A staining panel is not a functional assay; a folder that covers 3
+   clones cannot test a 12-clone claim. When the Pennsieve tools are
+   available, call `describe_discover_folder` on each folder you plan to use.
+   If the deposit cannot test the claim as stated, do not substitute a proxy:
+   write a short notebook that documents the check, and report the status
+   `not_testable` (step 5).
+   Then inspect the data itself. Look at actual columns, dtypes, NaN rates —
+   do NOT assume schema from the title alone.
 2. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
    end-to-end: load → preprocess → analysis → conclusion.
 3. Run it via papermill. Fix errors iteratively.
@@ -322,9 +338,13 @@ root privileges; standard `pip install` will fail.
 5. Write `{STATUS_FILE}` in your working directory, as JSON:
    `{{"status": "tested", "data_files": ["data/files/...", ...]}}` when the
    notebook analyzed the deposit's data, listing every data file it read, or
+   `{{"status": "not_testable", "reason": "<what the deposit lacks>", "data_files": [...]}}`
+   when the deposit cannot test the claim as stated (step 1), listing the
+   files you checked, or
    `{{"status": "blocked", "blocker": "<what stopped you>", "data_files": []}}`
-   when it could not. A blocked analysis is a valid, honest outcome. Never
-   report "tested" for an analysis that did not read the deposit's data.
+   when you could not reach or read the data. Both are valid, honest
+   outcomes. Never report "tested" for an analysis that did not read the
+   deposit's data.
 
 Your working directory is `{workdir}`. Write all files there.
 """
@@ -347,6 +367,11 @@ def _format_datasets_brief(bb: Blackboard) -> str:
 
 
 STATUS_FILE = "analysis_status.json"
+
+
+class NotTestable(RuntimeError):
+    """The deposit cannot test the hypothesis as stated. An honest outcome,
+    recorded on the hypothesis; it is not an analysis failure."""
 
 PENNSIEVE_TOOLS_SECTION = """## Pennsieve tools
 
@@ -390,6 +415,8 @@ def check_analysis_status(workdir: Path) -> dict:
         status = json.loads(path.read_text())
     except ValueError as exc:
         raise RuntimeError(f"{STATUS_FILE} is not valid JSON: {exc}") from exc
+    if status.get("status") == "not_testable":
+        raise NotTestable(status.get("reason") or "(no reason given)")
     if status.get("status") == "blocked":
         raise RuntimeError(f"the analyst reported the analysis as blocked: "
                            f"{status.get('blocker') or '(no reason given)'}")

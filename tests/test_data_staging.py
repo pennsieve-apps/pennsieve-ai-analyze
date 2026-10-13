@@ -125,3 +125,22 @@ def test_the_methods_critic_sees_the_status_report_and_the_no_data_rule(monkeypa
                        notebook_path=tmp_path / "analysis.ipynb")
     assert '"blocker": "access denied"' in seen["user"]
     assert "is never sound" in seen["system"]
+
+
+def test_a_not_testable_status_is_its_own_outcome(tmp_path):
+    write_status(tmp_path, {"status": "not_testable", "reason": "ADCP covers 3 of 12 clones", "data_files": []})
+    with pytest.raises(agentic_analyst.NotTestable, match="3 of 12 clones"):
+        agentic_analyst.check_analysis_status(tmp_path)
+
+
+def test_a_critic_issue_without_a_kind_counts_as_fixable(monkeypatch, tmp_path):
+    from analyze.agents import methods_critic
+    monkeypatch.setattr(methods_critic, "call_json", lambda client, **kw: {
+        "verdict": "concerns", "issues": [{"severity": "high", "description": "x"}], "suggested_followups": []})
+    import nbformat
+    nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("1", execution_count=1)]),
+                   tmp_path / "analysis.ipynb")
+    h = hypothesis()
+    h.analysis_summary = "s"
+    methods_critic.run(Blackboard("q", "s"), client=None, hypothesis=h, notebook_path=tmp_path / "analysis.ipynb")
+    assert h.methods_critique["issues"][0]["kind"] == "fixable"

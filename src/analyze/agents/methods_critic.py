@@ -43,7 +43,14 @@ def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_p
         "own data (for example, a notebook that only reports that the data "
         "could not be downloaded, or that uses synthetic or made-up values) "
         "is never sound: give the verdict \"unsound\" with a high-severity "
-        "issue saying what was not analyzed."
+        "issue saying what was not analyzed. "
+        "Give every issue a kind. \"fixable\": a better analysis of this "
+        "deposit could resolve it (gating, controls, statistics, metric choice). "
+        "\"data_limit\": no analysis of this deposit can resolve it, because "
+        "the data or the hypothesis itself lacks what is needed (the assay is "
+        "not a valid readout of the claim, the needed samples, replicates or "
+        "conditions are not in the deposit). Be strict: use data_limit only "
+        "when you can say what is missing from the deposit."
     )
     user = f"""## Hypothesis
 {hypothesis.claim}
@@ -67,7 +74,7 @@ Produce a JSON object with this shape:
 {{
   "verdict": "sound" | "concerns" | "unsound",
   "issues": [
-    {{"severity": "high|medium|low", "section": "<notebook section or 'overall'>", "description": "..."}}
+    {{"severity": "high|medium|low", "kind": "fixable|data_limit", "section": "<notebook section or 'overall'>", "description": "..."}}
   ],
   "suggested_followups": ["..."]
 }}
@@ -90,6 +97,11 @@ Produce a JSON object with this shape:
     if any(not isinstance(i, dict) or i.get("severity") not in {"high", "medium", "low"}
            for i in result["issues"]):
         raise ValueError("Methods critic returned an invalid issue")
+    for issue in result["issues"]:
+        # An issue without a valid kind counts as fixable, so the methods loop
+        # keeps going rather than stopping early on a guess.
+        if issue.get("kind") not in {"fixable", "data_limit"}:
+            issue["kind"] = "fixable"
     hypothesis.methods_critique = result
     bb.log("methods_critic", "done",
            f"hypothesis {hypothesis.id}: verdict={result.get('verdict', '?')}, "

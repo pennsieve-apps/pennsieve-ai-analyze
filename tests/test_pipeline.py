@@ -137,3 +137,54 @@ def test_direct_backend_passes_a_background_model(monkeypatch, tmp_path):
     asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
 
     assert seen == ["us.anthropic.claude-haiku-4-5-20251001-v1:0"]
+
+
+def _loop(monkeypatch, tmp_path, issues, analyst_raises=None):
+    """Run the methods loop with a fake analyst and a critic that always returns `issues`."""
+    monkeypatch.setenv("VP_ANALYZE_MAX_METHODS_ITERS", "3")
+    h = _hypothesis(1)
+    bb = Blackboard("q", "dataset", hypotheses=[h], critic_reviews=[_review(1)])
+    rounds = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+        rounds.append(1)
+        folder = workdir / "hypotheses" / hyp.id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "analysis.ipynb").write_text("{}")
+        if analyst_raises:
+            raise analyst_raises
+
+    def critic(bb, client, hyp, **kwargs):
+        hyp.methods_critique = {"verdict": "concerns", "issues": issues}
+    monkeypatch.setattr(pipeline.agentic_analyst, "run", analyst)
+    monkeypatch.setattr(pipeline.methods_critic, "run", critic)
+    client = type("Client", (), {"resolve_model": lambda self, role: "model"})()
+    return bb, h, rounds, client
+
+
+def test_only_data_limits_stop_the_loop_as_not_testable(monkeypatch, tmp_path):
+    issues = [{"severity": "high", "kind": "data_limit", "description": "staining panel is not an ADCP assay"},
+              {"severity": "medium", "kind": "fixable", "description": "no doublet gate"}]
+    bb, h, rounds, client = _loop(monkeypatch, tmp_path, issues)
+    with pytest.raises(pipeline.NotTestableStage, match="not testable with this deposit: the methods critic"):
+        asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    assert len(rounds) == 1, "no further rounds once only data limits remain"
+    assert h.methods_critique["outcome"] == "not_testable"
+    assert "staining panel" in (tmp_path / "hypotheses/H1/not_testable.json").read_text()
+
+
+def test_a_fixable_high_issue_keeps_the_loop_going(monkeypatch, tmp_path):
+    issues = [{"severity": "high", "kind": "data_limit", "description": "no replicates"},
+              {"severity": "high", "kind": "fixable", "description": "uncompensated channels"}]
+    bb, h, rounds, client = _loop(monkeypatch, tmp_path, issues)
+    with pytest.raises(RuntimeError, match="did not pass after 3"):
+        asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    assert len(rounds) == 3 and "outcome" not in h.methods_critique
+
+
+def test_the_analyst_reporting_not_testable_skips_the_critic(monkeypatch, tmp_path):
+    bb, h, rounds, client = _loop(monkeypatch, tmp_path, [],
+                                  analyst_raises=pipeline.agentic_analyst.NotTestable("only 3 clones have ADCP data"))
+    with pytest.raises(pipeline.NotTestableStage, match="the analyst found: only 3 clones"):
+        asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    assert len(rounds) == 1 and h.methods_critique["outcome"] == "not_testable"

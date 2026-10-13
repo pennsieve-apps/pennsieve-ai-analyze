@@ -30,7 +30,7 @@ from pennsieve_ai_utils.processor import (
     write_outputs,
 )
 
-from analyze.pipeline import run_analyze
+from analyze.pipeline import NotTestableStage, run_analyze
 
 STAGE = "analyze"
 
@@ -106,6 +106,15 @@ def main() -> int:
 
     try:
         asyncio.run(run_analyze(bb, client, workdir=output_dir))
+    except NotTestableStage as e:
+        # An honest result, not a crash: the deposit cannot test the hypotheses
+        # analyzed. Outputs are kept, and the stage does not pass, so Write does
+        # not build a manuscript on it.
+        bb.log(STAGE, "not_testable", str(e))
+        write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
+        for hyp_id, reason in e.reasons.items():
+            print(f"\n{hyp_id} is not testable with this deposit.\n  {reason}", flush=True)
+        return 7
     except (Exception, KeyboardInterrupt) as e:
         bb.log(STAGE, "fatal", repr(e))
         write_outputs(bb, output_dir, client.usage_log, stage=STAGE)

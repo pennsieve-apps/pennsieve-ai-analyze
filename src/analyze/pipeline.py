@@ -59,23 +59,56 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
     # when it talks to Bedrock or the Anthropic API directly.
     background_model = ("" if getattr(client, "backend", "governor") == "governor"
                         else client.resolve_model("bulk"))
+    passed: list[str] = []
+    not_testable: dict[str, str] = {}
     for hyp in targets:
         for iteration in range(1, max_iters + 1):
             bb.log("analyze", "iteration", f"{hyp.id}: {iteration}/{max_iters}")
-            await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=analyst_model,
-                                      background_model=background_model,
-                                      usage_log=getattr(client, "usage_log", None))
             folder = workdir / "hypotheses" / hyp.id
+            try:
+                await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=analyst_model,
+                                          background_model=background_model,
+                                          usage_log=getattr(client, "usage_log", None))
+            except agentic_analyst.NotTestable as exc:
+                _record_not_testable(bb, hyp, folder, f"the analyst found: {exc}", not_testable)
+                break
             methods_critic.run(bb, client, hyp, notebook_path=folder / "analysis.ipynb")
             critique = hyp.methods_critique
             (folder / f"methods.iter{iteration}.json").write_text(json.dumps(critique, indent=2))
             shutil.copy2(folder / "analysis.ipynb", folder / f"analysis.iter{iteration}.ipynb")
             bb.save(workdir / f"blackboard.{hyp.id}.iter{iteration}.json")
-            if critique.get("verdict") == "sound" and not any(
-                issue.get("severity") == "high" for issue in critique.get("issues", [])
-            ):
+            high = [i for i in critique.get("issues", []) if i.get("severity") == "high"]
+            if critique.get("verdict") == "sound" and not high:
+                passed.append(hyp.id)
+                break
+            if high and all(i.get("kind") == "data_limit" for i in high):
+                # No revision of the analysis can fix these, so another round would
+                # only repeat them. Record the honest outcome and stop.
+                reasons = "; ".join(i.get("description", "") for i in high)
+                _record_not_testable(bb, hyp, folder, f"the methods critic found: {reasons}", not_testable)
                 break
             bb.log("analyze", "revision_required", f"{hyp.id}: {json.dumps(critique)}")
         else:
             raise RuntimeError(f"{hyp.id}: methods review did not pass after {max_iters} iterations; "
                                "notebook and critiques retained for review")
+    if not passed and not_testable:
+        raise NotTestableStage(not_testable)
+
+
+class NotTestableStage(RuntimeError):
+    """No analyzed hypothesis passed, and at least one cannot be tested with the
+    deposit. The stage stops, without a manuscript, and says why."""
+
+    def __init__(self, reasons: dict[str, str]) -> None:
+        self.reasons = reasons
+        super().__init__("; ".join(f"{h} is not testable with this deposit: {r}" for h, r in reasons.items()))
+
+
+def _record_not_testable(bb: Blackboard, hyp, folder: Path, reason: str, out: dict[str, str]) -> None:
+    critique = dict(hyp.methods_critique or {})
+    critique.update(outcome="not_testable", not_testable_reason=reason)
+    hyp.methods_critique = critique
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "not_testable.json").write_text(json.dumps({"hypothesis_id": hyp.id, "reason": reason}, indent=2))
+    bb.log("analyze", "not_testable", f"{hyp.id}: {reason}")
+    out[hyp.id] = reason
