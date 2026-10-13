@@ -46,6 +46,11 @@ from analyze import data_staging
 # real-world data quirks; the agent should self-terminate well before.
 MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
 
+# The pennsieve-mcp server, when the run provides one (VP_PENNSIEVE_MCP_URL).
+# Claude Code names its tools mcp__<server>__<tool>.
+MCP_SERVER = "pennsieve"
+MCP_TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
+
 # Tool results are cut to this many characters in the trace, unless
 # VP_LOG_LLM_IO=1 asks for the full transcript.
 TRACE_RESULT_CHARS = 8000
@@ -93,6 +98,7 @@ async def run(
     # through the public Discover route. Raises DataStagingError if the
     # dataset cannot be reached, so the stage stops instead of guessing.
     staging = data_staging.stage(bb, hypothesis, hyp_workdir)
+    mcp_url = os.environ.get("VP_PENNSIEVE_MCP_URL", "").strip()
     task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir, staging)
     print(
         f"  [agent] hypothesis {hypothesis.id}: model={model_id} cwd={hyp_workdir}",
@@ -104,9 +110,13 @@ async def run(
     async def _allow_all(tool_name, tool_input, context):
         if tool_name in {"Read", "Write", "Edit", "Bash", "NotebookEdit"}:
             return PermissionResultAllow()
+        if mcp_url and tool_name.startswith(MCP_TOOL_PREFIX):
+            return PermissionResultAllow()
         return PermissionResultDeny(message="Tool is not enabled for this analysis")
 
     options = ClaudeAgentOptions(
+        # The pennsieve-mcp server's public Discover tools, when the run provides one.
+        mcp_servers={MCP_SERVER: {"type": "http", "url": mcp_url}} if mcp_url else {},
         model=model_id,
         max_turns=MAX_TURNS,
         # Broad allowed_tools entries bypass can_use_tool in the SDK.
@@ -266,6 +276,8 @@ def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path,
                 + json.dumps(hypothesis.methods_critique, indent=2)
                 if hypothesis.methods_critique else "")
     data_access = data_staging.prompt_section(staging) if staging else ""
+    if os.environ.get("VP_PENNSIEVE_MCP_URL", "").strip():
+        data_access += "\n\n" + PENNSIEVE_TOOLS_SECTION
     return f"""You are running a single analysis to test one hypothesis.
 
 You have Read, Write, Edit, and Bash tools. Use Bash to run Python:
@@ -335,6 +347,23 @@ def _format_datasets_brief(bb: Blackboard) -> str:
 
 
 STATUS_FILE = "analysis_status.json"
+
+PENNSIEVE_TOOLS_SECTION = """## Pennsieve tools
+
+You also have Pennsieve tools for published datasets. They are public and need no login:
+
+- `list_discover_files`: the files in one folder of a dataset. Each file has a
+  `download_path`; pass it to the other tools.
+- `read_discover_file_headers`: what an FCS or EDF file records (channel names
+  and stains, or signal labels and sampling rates), without downloading it.
+  Use it to check that the channels or signals your test needs exist.
+- `preview_discover_file`: the first part of a text file, such as a TSV or CSV.
+- `get_discover_file_link`: a short-lived download link for one file.
+- `get_discover_dataset`, `search_discover_datasets`, `lookup_citation`: dataset
+  metadata, other published datasets, and DOI lookups.
+
+Download the files your notebook analyzes into `data/` with the download
+command above, so the notebook can be run again."""
 
 
 def check_analysis_status(workdir: Path) -> dict:

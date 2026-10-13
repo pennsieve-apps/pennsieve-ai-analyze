@@ -133,3 +133,54 @@ def test_a_clean_notebook_that_analyzed_no_data_fails(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="Agentic analysis failed"):
         asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="m"))
     assert h.analysis_summary == ""
+
+
+def test_the_analyst_gets_the_pennsieve_tools_when_the_run_provides_them(monkeypatch, tmp_path):
+    seen = {}
+
+    class Client:
+        def __init__(self, options):
+            seen["options"] = options
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            seen["prompt"] = prompt
+            write_outputs(tmp_path / "hypotheses/H1")
+        async def receive_response(self):
+            yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.1, result="done", usage={})
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    monkeypatch.setenv("VP_PENNSIEVE_MCP_URL", "http://pennsieve-mcp:8090/mcp")
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="m"))
+    options = seen["options"]
+    assert options.mcp_servers == {"pennsieve": {"type": "http", "url": "http://pennsieve-mcp:8090/mcp"}}
+    assert "read_discover_file_headers" in seen["prompt"]
+    allow = asyncio.run(options.can_use_tool("mcp__pennsieve__list_discover_files", {}, None))
+    deny = asyncio.run(options.can_use_tool("mcp__other__anything", {}, None))
+    assert type(allow).__name__ == "PermissionResultAllow" and type(deny).__name__ == "PermissionResultDeny"
+
+
+def test_without_a_server_the_analyst_gets_no_mcp_tools(monkeypatch, tmp_path):
+    seen = {}
+
+    class Client:
+        def __init__(self, options):
+            seen["options"] = options
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            write_outputs(tmp_path / "hypotheses/H1")
+        async def receive_response(self):
+            yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.1, result="done", usage={})
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    monkeypatch.delenv("VP_PENNSIEVE_MCP_URL", raising=False)
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    asyncio.run(agentic_analyst.run(Blackboard("q", "dataset"), h, workdir=tmp_path, model_id="m"))
+    assert seen["options"].mcp_servers == {}
+    deny = asyncio.run(seen["options"].can_use_tool("mcp__pennsieve__list_discover_files", {}, None))
+    assert type(deny).__name__ == "PermissionResultDeny"
