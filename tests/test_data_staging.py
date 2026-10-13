@@ -144,3 +144,42 @@ def test_a_critic_issue_without_a_kind_counts_as_fixable(monkeypatch, tmp_path):
     h.analysis_summary = "s"
     methods_critic.run(Blackboard("q", "s"), client=None, hypothesis=h, notebook_path=tmp_path / "analysis.ipynb")
     assert h.methods_critique["issues"][0]["kind"] == "fixable"
+
+
+def make_bids_tree(tmp_path):
+    """The shape of pennsieve:530: one electrodes.tsv per subject."""
+    for subject in ("CHOP005", "CHOP006", "CHOP007"):
+        folder = tmp_path / "data/files/DATA" / f"sub-{subject}" / "derivatives"
+        folder.mkdir(parents=True)
+        (folder / "electrodes.tsv").write_text("name\tx\ty\tz\n")
+    (tmp_path / "data/files/DATA/annotations.tsv").write_text("onset\n")
+
+
+def test_a_glob_over_many_subjects_passes(tmp_path):
+    make_bids_tree(tmp_path)
+    write_status(tmp_path, {"status": "tested", "data_files": [
+        "data/files/DATA/annotations.tsv",
+        "data/files/DATA/sub-*/derivatives/electrodes.tsv",
+    ]})
+    assert agentic_analyst.check_analysis_status(tmp_path)["status"] == "tested"
+
+
+def test_a_glob_with_a_trailing_note_passes(tmp_path):
+    # The exact entry that stopped a run on pennsieve:530.
+    make_bids_tree(tmp_path)
+    write_status(tmp_path, {"status": "tested", "data_files": [
+        "data/files/DATA/sub-*/derivatives/electrodes.tsv (all 29 subjects)"]})
+    assert agentic_analyst.check_analysis_status(tmp_path)["status"] == "tested"
+
+
+@pytest.mark.parametrize("entry", [
+    "data/files/DATA/sub-*/derivatives/channels.tsv",   # glob matches nothing
+    "data/files/*/nothing-here.tsv",
+    "(all 29 subjects)",                                # a note and no path
+    "../../etc/*",                                      # outside the working directory
+])
+def test_a_glob_that_matches_no_real_file_still_fails(tmp_path, entry):
+    make_bids_tree(tmp_path)
+    write_status(tmp_path, {"status": "tested", "data_files": [entry]})
+    with pytest.raises(RuntimeError, match="not in"):
+        agentic_analyst.check_analysis_status(tmp_path)

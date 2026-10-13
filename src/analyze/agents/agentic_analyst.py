@@ -337,7 +337,11 @@ root privileges; standard `pip install` will fail.
    not supported by the data. Be honest about assumptions and limits.
 5. Write `{STATUS_FILE}` in your working directory, as JSON:
    `{{"status": "tested", "data_files": ["data/files/...", ...]}}` when the
-   notebook analyzed the deposit's data, listing every data file it read, or
+   notebook analyzed the deposit's data, listing every data file it read.
+   Each entry is a path relative to your working directory. A glob such as
+   `data/files/DATA/sub-*/derivatives/electrodes.tsv` is fine when you read
+   many files of the same shape, as long as it matches files that are really
+   there. Or
    `{{"status": "not_testable", "reason": "<what the deposit lacks>", "data_files": [...]}}`
    when the deposit cannot test the claim as stated (step 1), listing the
    files you checked, or
@@ -425,13 +429,40 @@ def check_analysis_status(workdir: Path) -> dict:
     files = status.get("data_files")
     if not isinstance(files, list) or not files:
         raise RuntimeError(f"{STATUS_FILE} lists no data files that the analysis read")
-    root = workdir.resolve()
-    missing = [f for f in files
-               if not (root / f).resolve().is_relative_to(root) or not (root / f).resolve().is_file()]
+    missing = [f for f in files if not _entry_matches_a_file(workdir, f)]
     if missing:
         raise RuntimeError(f"{STATUS_FILE} lists data files that are not in {workdir}: "
                            + ", ".join(map(str, missing[:5])))
     return status
+
+
+# A trailing note after a path, such as "sub-*/electrodes.tsv (all 29 subjects)".
+_TRAILING_NOTE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _entry_matches_a_file(workdir: Path, entry: str) -> bool:
+    """Does one `data_files` entry name at least one real file under `workdir`?
+
+    The check exists so the analyst cannot claim data it never read, so every
+    entry must still resolve to a file that is really there. The entry itself
+    may be written in any form an analyst reasonably reaches for: a plain path,
+    a glob covering many subjects, or either of those followed by a note in
+    brackets. A run on `pennsieve:530` failed on
+    `data/files/DATA/sub-*/derivatives/electrodes.tsv (all 29 subjects)`, which
+    was a true statement about 29 files that were present.
+    """
+    text = _TRAILING_NOTE.sub("", str(entry)).strip()
+    if not text:
+        return False
+    root = workdir.resolve()
+
+    def inside_and_real(path: Path) -> bool:
+        resolved = path.resolve()
+        return resolved.is_relative_to(root) and resolved.is_file()
+
+    if any(ch in text for ch in "*?["):
+        return any(inside_and_real(match) for match in workdir.glob(text))
+    return inside_and_real(workdir / text)
 
 
 def validate_notebook(path: Path) -> None:
