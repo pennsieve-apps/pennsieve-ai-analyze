@@ -352,6 +352,15 @@ PENNSIEVE_TOOLS_SECTION = """## Pennsieve tools
 
 You also have Pennsieve tools for published datasets. They are public and need no login:
 
+- `find_discover_files`: search every file of a dataset by path pattern
+  (`*` within a folder, `**` across folders) or file type. Use it instead of
+  opening folders one by one.
+- `describe_discover_folder`: what the FCS or EDF files in one folder record
+  (channel layouts, stains or sampling rates, event counts) and the distinct
+  sample names in it. Use it to check that a planned test's channels,
+  conditions and samples exist before writing the notebook.
+- `summarize_discover_table`: the columns, guessed types and first rows of a
+  CSV or TSV file.
 - `list_discover_files`: the files in one folder of a dataset. Each file has a
   `download_path`; pass it to the other tools.
 - `read_discover_file_headers`: what an FCS or EDF file records (channel names
