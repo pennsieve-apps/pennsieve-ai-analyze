@@ -26,17 +26,37 @@ def _hypotheses_to_analyze(bb: Blackboard) -> list:
     Default: the first accepted hypothesis in Hypothesize's final iteration. Locked
     hypotheses keep their IDs across iterations, so selecting from the final
     slate ensures Write later reads the same record that Analyze updates.
-    Override the count via `VP_ANALYZE_TOP_N`.
+
+    `VP_ANALYZE_TOP_N` sets how many to take. `VP_ANALYZE_HYPOTHESIS_IDS`, a
+    comma-separated list, names exactly which ones instead, in the order given;
+    it is for picking up a specific accepted hypothesis when the first one turns
+    out not to be testable. Each named ID must be accepted at the final
+    iteration, because Analyze only runs what Hypothesize passed and Write only
+    writes what passes methods review.
     """
-    n = int(os.environ.get("VP_ANALYZE_TOP_N", "1"))
-    if n < 1:
-        raise ValueError("VP_ANALYZE_TOP_N must be at least 1")
     if not bb.hypotheses:
         return []
     final_iteration = bb.iterations_completed or max(h.iteration for h in bb.hypotheses)
     reviews = {r.hypothesis_id: r for r in bb.reviews_at(final_iteration)}
-    return [h for h in bb.hypotheses_at(final_iteration)
-            if h.id in reviews and reviews[h.id].verdict == "accept"][:n]
+    accepted = [h for h in bb.hypotheses_at(final_iteration)
+                if h.id in reviews and reviews[h.id].verdict == "accept"]
+
+    wanted = [p.strip() for p in os.environ.get("VP_ANALYZE_HYPOTHESIS_IDS", "").split(",") if p.strip()]
+    if wanted:
+        by_id = {h.id: h for h in accepted}
+        missing = [hid for hid in wanted if hid not in by_id]
+        if missing:
+            have = ", ".join(by_id) or "(none)"
+            raise ValueError(
+                f"VP_ANALYZE_HYPOTHESIS_IDS names {', '.join(missing)}, "
+                f"which {'is' if len(missing) == 1 else 'are'} not accepted at the final "
+                f"iteration. Accepted and analyzable: {have}.")
+        return [by_id[hid] for hid in wanted]
+
+    n = int(os.environ.get("VP_ANALYZE_TOP_N", "1"))
+    if n < 1:
+        raise ValueError("VP_ANALYZE_TOP_N must be at least 1")
+    return accepted[:n]
 
 
 async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> None:

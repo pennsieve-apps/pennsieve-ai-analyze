@@ -220,3 +220,39 @@ def test_the_analyst_reporting_not_testable_skips_the_critic(monkeypatch, tmp_pa
     with pytest.raises(pipeline.NotTestableStage, match="the analyst found: only 3 clones"):
         asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
     assert len(rounds) == 1 and h.methods_critique["outcome"] == "not_testable"
+
+
+def _hyp(hid, iteration=3):
+    return Hypothesis(id=hid, claim=hid, rationale="r", supporting_evidence=[],
+                      predicted_observation="p", suggested_experiment="e", iteration=iteration)
+
+
+def _accept(hid, iteration=3):
+    return CriticReview(hid, 4, 4, 4, 4, [], "accept", iteration)
+
+
+def test_a_named_hypothesis_id_is_selected(monkeypatch):
+    """VP_ANALYZE_HYPOTHESIS_IDS picks a specific accepted hypothesis when the
+    first one turns out not to be testable."""
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_IDS", "H3")
+    bb = Blackboard("q", "pennsieve:405", iterations_completed=3,
+                    hypotheses=[_hyp("H2"), _hyp("H3"), _hyp("H5")],
+                    critic_reviews=[_accept("H2"), _accept("H3"), _accept("H5")])
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H3"]
+
+
+def test_named_ids_keep_their_order(monkeypatch):
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_IDS", "H5, H2")
+    bb = Blackboard("q", "s", iterations_completed=3,
+                    hypotheses=[_hyp("H2"), _hyp("H3"), _hyp("H5")],
+                    critic_reviews=[_accept("H2"), _accept("H3"), _accept("H5")])
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H5", "H2"]
+
+
+def test_a_named_id_that_was_not_accepted_is_refused(monkeypatch):
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_IDS", "H4")
+    bb = Blackboard("q", "s", iterations_completed=3,
+                    hypotheses=[_hyp("H2"), _hyp("H3")],
+                    critic_reviews=[_accept("H2"), _accept("H3")])
+    with pytest.raises(ValueError, match="H4.*not accepted"):
+        pipeline._hypotheses_to_analyze(bb)
