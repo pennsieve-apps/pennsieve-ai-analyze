@@ -40,6 +40,8 @@ from pennsieve_ai_utils.backend import claude_code_env, llm_backend
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 from pennsieve_ai_utils.llm import raw_io_enabled
 
+from analyze import data_staging
+
 # Maximum agent turns. Generous so the agent has room to iterate on
 # real-world data quirks; the agent should self-terminate well before.
 MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
@@ -87,7 +89,11 @@ async def run(
     hyp_workdir = (workdir / "hypotheses" / hypothesis.id).resolve()
     hyp_workdir.mkdir(parents=True, exist_ok=True)
 
-    task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir)
+    # Download the dataset's file index and a sample before the agent starts,
+    # through the public Discover route. Raises DataStagingError if the
+    # dataset cannot be reached, so the stage stops instead of guessing.
+    staging = data_staging.stage(bb, hypothesis, hyp_workdir)
+    task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir, staging)
     print(
         f"  [agent] hypothesis {hypothesis.id}: model={model_id} cwd={hyp_workdir}",
         flush=True,
@@ -186,6 +192,7 @@ async def run(
         if not completed or not final_text.strip():
             raise RuntimeError("Agent ended without a successful result and summary")
         validate_notebook(hyp_workdir / "analysis.ipynb")
+        check_analysis_status(hyp_workdir)
     except Exception as e:
         hypothesis.analysis_cost_usd += total_cost
         hypothesis.analysis_tools_called.extend(tools_called)
@@ -247,7 +254,8 @@ def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, t
     })
 
 
-def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) -> str:
+def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path,
+                       staging: data_staging.StagingResult | None = None) -> str:
     """Render the initial task prompt the analyst receives. Kept minimal in
     the scaffold; the prototype version is far richer (per-dataset blocks,
     role sequences for cross-dataset hypotheses, narrowed-claim handling).
@@ -257,6 +265,7 @@ def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) ->
     revision = ("\n## Required methods revisions\nRevise the existing notebook and re-execute ALL cells.\n"
                 + json.dumps(hypothesis.methods_critique, indent=2)
                 if hypothesis.methods_critique else "")
+    data_access = data_staging.prompt_section(staging) if staging else ""
     return f"""You are running a single analysis to test one hypothesis.
 
 You have Read, Write, Edit, and Bash tools. Use Bash to run Python:
@@ -279,6 +288,8 @@ root privileges; standard `pip install` will fail.
 **Rationale:** {hypothesis.rationale}
 {revision}
 
+{data_access}
+
 ## Datasets available
 
 {datasets_block}
@@ -296,6 +307,12 @@ root privileges; standard `pip install` will fail.
 4. When the notebook runs cleanly, write a short summary of what you
    found and whether the claim is supported, partially supported, or
    not supported by the data. Be honest about assumptions and limits.
+5. Write `{STATUS_FILE}` in your working directory, as JSON:
+   `{{"status": "tested", "data_files": ["data/files/...", ...]}}` when the
+   notebook analyzed the deposit's data, listing every data file it read, or
+   `{{"status": "blocked", "blocker": "<what stopped you>", "data_files": []}}`
+   when it could not. A blocked analysis is a valid, honest outcome. Never
+   report "tested" for an analysis that did not read the deposit's data.
 
 Your working directory is `{workdir}`. Write all files there.
 """
@@ -308,8 +325,6 @@ def _format_datasets_brief(bb: Blackboard) -> str:
     for d in bb.dataset_summaries:
         out.append(
             f"- **{d.id}**: {d.title}\n"
-            f"  - Bucket: {d.bucket_uri or '(none)'}\n"
-            f"  - Access: {d.access_type or 'unknown'}\n"
             f"  - {d.description[:300]}"
             f"\n  - Repository URL: {d.url}"
             f"\n  - README: {d.readme[:1500]}"
@@ -317,6 +332,41 @@ def _format_datasets_brief(bb: Blackboard) -> str:
             f"\n  - Record tables: {json.dumps(d.record_tables)[:3000]}"
         )
     return "\n".join(out)
+
+
+STATUS_FILE = "analysis_status.json"
+
+
+def check_analysis_status(workdir: Path) -> dict:
+    """Require the analyst's own report that it analyzed the deposit's data.
+
+    A notebook can run cleanly and still analyze nothing, for example when it
+    only reports that the data could not be downloaded. The analyst writes
+    `analysis_status.json`; this raises unless the status is "tested" and every
+    data file it lists exists in the working directory.
+    """
+    path = workdir / STATUS_FILE
+    if not path.is_file():
+        raise RuntimeError(f"the analyst did not write {STATUS_FILE}")
+    try:
+        status = json.loads(path.read_text())
+    except ValueError as exc:
+        raise RuntimeError(f"{STATUS_FILE} is not valid JSON: {exc}") from exc
+    if status.get("status") == "blocked":
+        raise RuntimeError(f"the analyst reported the analysis as blocked: "
+                           f"{status.get('blocker') or '(no reason given)'}")
+    if status.get("status") != "tested":
+        raise RuntimeError(f"{STATUS_FILE} has status {status.get('status')!r}; expected 'tested'")
+    files = status.get("data_files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError(f"{STATUS_FILE} lists no data files that the analysis read")
+    root = workdir.resolve()
+    missing = [f for f in files
+               if not (root / f).resolve().is_relative_to(root) or not (root / f).resolve().is_file()]
+    if missing:
+        raise RuntimeError(f"{STATUS_FILE} lists data files that are not in {workdir}: "
+                           + ", ".join(map(str, missing[:5])))
+    return status
 
 
 def validate_notebook(path: Path) -> None:

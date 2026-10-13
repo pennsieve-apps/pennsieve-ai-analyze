@@ -31,13 +31,19 @@ def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_p
     if not notebook_text:
         raise RuntimeError("Methods critic requires the executed notebook, not just a summary")
     notebook_text = _compact_notebook(notebook_text)
+    status_path = (notebook_path.parent if notebook_path else Path(".")) / "analysis_status.json"
+    status_text = status_path.read_text() if status_path.is_file() else "(the analyst wrote no status file)"
 
     system = (
         "You are a methods critic reviewing an automated data analysis. "
         "Be honest, specific, and concise. Flag failed assumptions, "
         "inappropriate statistical choices, missing controls, and weak "
         "inferences. If the analysis is sound, say so plainly — no false "
-        "positives."
+        "positives. An analysis that did not read and analyze the deposit's "
+        "own data (for example, a notebook that only reports that the data "
+        "could not be downloaded, or that uses synthetic or made-up values) "
+        "is never sound: give the verdict \"unsound\" with a high-severity "
+        "issue saying what was not analyzed."
     )
     user = f"""## Hypothesis
 {hypothesis.claim}
@@ -47,6 +53,9 @@ def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_p
 
 ## Analyst summary
 {hypothesis.analysis_summary}
+
+## Analyst's status report (analysis_status.json)
+{status_text}
 
 ## Notebook (truncated)
 ```

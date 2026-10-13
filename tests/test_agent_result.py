@@ -9,6 +9,23 @@ from analyze.agents import agentic_analyst
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 
 
+@pytest.fixture(autouse=True)
+def _no_staging(monkeypatch):
+    """These tests cover the agent loop; data staging has its own tests."""
+    monkeypatch.setattr(agentic_analyst.data_staging, "stage", lambda bb, h, workdir: None)
+
+
+def write_outputs(workdir):
+    """What a successful analyst leaves behind: an executed notebook, the data
+    file it read, and its status report."""
+    cell = nbformat.v4.new_code_cell("print(1)", execution_count=1)
+    nbformat.write(nbformat.v4.new_notebook(cells=[cell]), workdir / "analysis.ipynb")
+    (workdir / "data").mkdir(exist_ok=True)
+    (workdir / "data/a.fcs").write_text("x")
+    (workdir / agentic_analyst.STATUS_FILE).write_text(
+        '{"status": "tested", "data_files": ["data/a.fcs"]}')
+
+
 @pytest.mark.parametrize("subtype,notebook,passes", [("success", True, True), ("error_max_turns", True, False), ("success", False, False)])
 def test_agent_requires_success_result_and_executed_notebook(monkeypatch, tmp_path, subtype, notebook, passes):
     class Client:
@@ -20,8 +37,7 @@ def test_agent_requires_success_result_and_executed_notebook(monkeypatch, tmp_pa
             return False
         async def query(self, prompt):
             if notebook:
-                cell = nbformat.v4.new_code_cell("print(1)", execution_count=1)
-                nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "hypotheses/H1/analysis.ipynb")
+                write_outputs(tmp_path / "hypotheses/H1")
         async def receive_response(self):
             yield SimpleNamespace(subtype=subtype, is_error=subtype != "success", total_cost_usd=0.1, result="analysis summary", usage={})
     monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
@@ -51,8 +67,7 @@ def test_raw_io_trace_keeps_the_full_transcript(monkeypatch, tmp_path):
         async def __aexit__(self, *args):
             return False
         async def query(self, prompt):
-            cell = nbformat.v4.new_code_cell("print(1)", execution_count=1)
-            nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "hypotheses/H1/analysis.ipynb")
+            write_outputs(tmp_path / "hypotheses/H1")
         async def receive_response(self):
             yield SimpleNamespace(model="m", usage={"input_tokens": 5, "output_tokens": 1}, content=[
                 SimpleNamespace(thinking="plan", signature=""), SimpleNamespace(text="looking")])
@@ -79,8 +94,7 @@ def test_analyst_tokens_are_added_to_the_usage_log(monkeypatch, tmp_path):
         async def __aexit__(self, *args):
             return False
         async def query(self, prompt):
-            cell = nbformat.v4.new_code_cell("print(1)", execution_count=1)
-            nbformat.write(nbformat.v4.new_notebook(cells=[cell]), tmp_path / "hypotheses/H1/analysis.ipynb")
+            write_outputs(tmp_path / "hypotheses/H1")
         async def receive_response(self):
             yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.5, result="done",
                                   num_turns=7, usage={"input_tokens": 10, "output_tokens": 20,
@@ -96,3 +110,26 @@ def test_analyst_tokens_are_added_to_the_usage_log(monkeypatch, tmp_path):
     assert (row["input_tokens"], row["output_tokens"]) == (10, 20)
     assert (row["cache_read_input_tokens"], row["cache_creation_input_tokens"]) == (300, 40)
     assert row["sdk_reported_cost_usd"] == 0.5 and "cost_usd" not in row
+
+
+def test_a_clean_notebook_that_analyzed_no_data_fails(monkeypatch, tmp_path):
+    class Client:
+        def __init__(self, options):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            write_outputs(tmp_path / "hypotheses/H1")
+            (tmp_path / "hypotheses/H1" / agentic_analyst.STATUS_FILE).write_text(
+                '{"status": "blocked", "blocker": "403 from S3", "data_files": []}')
+        async def receive_response(self):
+            yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.1,
+                                  result="blocked", usage={})
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    with pytest.raises(RuntimeError, match="Agentic analysis failed"):
+        asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="m"))
+    assert h.analysis_summary == ""
