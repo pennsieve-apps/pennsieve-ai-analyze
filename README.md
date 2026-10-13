@@ -10,18 +10,39 @@ Write stage.
 
 For each selected hypothesis:
 
+0. **Data staging** — before the agent starts, the seed dataset's file index
+   and a bounded sample are downloaded into the hypothesis working directory
+   from the public Pennsieve Discover route. The analyst then works from local
+   files instead of spending turns probing an API. A dataset whose index
+   cannot be read raises an error, so the stage stops instead of guessing.
+   The sample size is bounded by `VP_ANALYZE_STAGE_FILES` and
+   `VP_ANALYZE_STAGE_MAX_MB`; set `VP_ANALYZE_STAGE_DATA=0` to write the index
+   only. (This currently runs on every backend; it assumes the deposit is
+   published to Discover and reachable from the compute node.)
+
 1. **Agentic Analyst** — a Claude Code session with Read/Write/Edit/Bash
-   tools. The agent inspects the dataset(s) named in the hypothesis,
+   tools, and the `pennsieve-mcp` Discover tools when the run provides one.
+   The agent inspects the dataset(s) named in the hypothesis,
    writes a Jupyter notebook that tests the claim, runs it via
    papermill, and iterates on errors. The stage requires a successful SDK
    terminal result and a cleanly executed notebook; turn-budget exhaustion is
-   retained in the trace and fails the analysis.
+   retained in the trace and fails the analysis. It reads FCS files with
+   `flowio`.
 
 2. **Analyst ⇄ Methods Critic loop** — the reasoning-role critic reviews the
    analyst's summary and notebook. A `concerns` or `unsound` verdict, or any
    high-severity issue, sends the critique back through another analyst pass.
    The bounded loop succeeds only on a `sound` verdict without high-severity
    issues; each notebook and critique is snapshotted for review.
+
+**Honest non-pass outcomes.** Not every hypothesis can be tested with the
+deposit, and that is a result rather than a crash. When the only remaining
+high-severity issues are data limits the analysis cannot fix, the stage
+records the hypothesis as **not testable** and exits 7. When the methods
+review simply never passes within the allowed rounds, it records the
+hypothesis as **unresolved** and exits 8. Both write the reason to
+`not_testable.json` or `unresolved.json` in the hypothesis folder, keep the
+notebooks, and do not count as a pass, so Write builds no manuscript on them.
 
 At startup, Analyze asks the governor which models it allows. It then sends a
 tiny test request to each model it plans to use. The analyst uses the
@@ -97,9 +118,13 @@ python -m analyze.main
 | `AWS_REGION` | _(required for `bedrock`)_ | This is the Bedrock region. Claude Code does not read the region from your AWS profile, so you must set it here. |
 | `VP_MODEL_BULK` | chosen at startup | On `bedrock` or `anthropic`, Claude Code uses this model for its small background requests. |
 | `VP_LOG_LLM_IO` | unset | Set this to `1` to save model requests and responses word for word. The methods critic's requests go to `llm-io.analyze.jsonl`. The file `agent-events.jsonl` becomes a full record of the Claude Code session. |
-| `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze |
+| `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze. Raise it to test several in one run; each that passes is written up, and the rest are recorded as not testable or unresolved. |
+| `VP_ANALYZE_HYPOTHESIS_IDS` | unset | A comma-separated list of hypothesis IDs to analyze, in order, instead of taking the top `VP_ANALYZE_TOP_N`. Each ID must be accepted at the final iteration. Use it to reach a specific accepted hypothesis when the first one is not testable. |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
 | `VP_ANALYZE_MAX_METHODS_ITERS` | `3` | Maximum analyst/critic passes before an unresolved methods review fails the stage |
+| `VP_ANALYZE_STAGE_FILES` | `12` | How many of the seed dataset's data files to download before the analyst starts |
+| `VP_ANALYZE_STAGE_MAX_MB` | `200` | Total size budget, in MiB, for that pre-download |
+| `VP_ANALYZE_STAGE_DATA` | unset | Set to `0` to write only the file index and download nothing |
 | `VP_MODEL_SONNET` | dynamically resolved | Explicit pin for the Agent SDK analyst's model role |
 | `VP_ANALYZE_MODEL` | unset | Backward-compatible alias for `VP_MODEL_SONNET`; conflicting pins fail preflight |
 | `VP_MODEL_OPUS` | dynamically resolved | Explicit pin for the methods critic's reasoning role |
