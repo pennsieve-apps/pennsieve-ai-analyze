@@ -103,7 +103,7 @@ python -m analyze.main
 | `VP_MODEL_SONNET` | dynamically resolved | Explicit pin for the Agent SDK analyst's model role |
 | `VP_ANALYZE_MODEL` | unset | Backward-compatible alias for `VP_MODEL_SONNET`; conflicting pins fail preflight |
 | `VP_MODEL_OPUS` | dynamically resolved | Explicit pin for the methods critic's reasoning role |
-| `VP_LLM_MAX_RETRIES` | `1` | Anthropic SDK retries within each direct routed attempt |
+| `VP_LLM_MAX_RETRIES` | `1` on the governor, `4` on `bedrock` or `anthropic` | How many times the Anthropic SDK retries a failed request. The governor keeps one retry, because each of its timeouts already takes a minute. Direct backends retry more, to ride out short network dropouts. |
 
 ## Pennsieve Test smoke check
 
