@@ -10,12 +10,24 @@ Write stage.
 
 For each selected hypothesis:
 
+0. **Data staging** — before the agent starts, the seed dataset's file index
+   and a bounded sample are downloaded into the hypothesis working directory
+   from the public Pennsieve Discover route. The analyst then works from local
+   files instead of spending turns probing an API. A dataset whose index
+   cannot be read raises an error, so the stage stops instead of guessing.
+   The sample size is bounded by `VP_ANALYZE_STAGE_FILES` and
+   `VP_ANALYZE_STAGE_MAX_MB`; set `VP_ANALYZE_STAGE_DATA=0` to write the index
+   only. (This currently runs on every backend; it assumes the deposit is
+   published to Discover and reachable from the compute node.)
+
 1. **Agentic Analyst** — a Claude Code session with Read/Write/Edit/Bash
-   tools. The agent inspects the dataset(s) named in the hypothesis,
+   tools, and the `pennsieve-mcp` Discover tools when the run provides one.
+   The agent inspects the dataset(s) named in the hypothesis,
    writes a Jupyter notebook that tests the claim, runs it via
    papermill, and iterates on errors. The stage requires a successful SDK
    terminal result and a cleanly executed notebook; turn-budget exhaustion is
-   retained in the trace and fails the analysis.
+   retained in the trace and fails the analysis. It reads FCS files with
+   `flowio`.
 
 2. **Analyst ⇄ Methods Critic loop** — the reasoning-role critic reviews the
    analyst's summary and notebook. A `concerns` or `unsound` verdict, or any
@@ -23,13 +35,25 @@ For each selected hypothesis:
    The bounded loop succeeds only on a `sound` verdict without high-severity
    issues; each notebook and critique is snapshotted for review.
 
-At startup, Analyze discovers the governor's effective allow-list and verifies
-that its concrete assignments are invokable. The Agent SDK analyst requests the
-logical synthesis role; the methods critic requests the reasoning role. With
-the previously observed Pennsieve Test allow-list, both resolved to Sonnet
-4.6. v0.0.6 re-discovers and verifies the current assignments at startup. A
-mid-run `model_not_allowed` or IAM `access_denied` response reroutes and retries
-the direct methods-critic request up to three bounded attempts.
+**Honest non-pass outcomes.** Not every hypothesis can be tested with the
+deposit, and that is a result rather than a crash. When the only remaining
+high-severity issues are data limits the analysis cannot fix, the stage
+records the hypothesis as **not testable** and exits 7. When the methods
+review simply never passes within the allowed rounds, it records the
+hypothesis as **unresolved** and exits 8. Both write the reason to
+`not_testable.json` or `unresolved.json` in the hypothesis folder, keep the
+notebooks, and do not count as a pass, so Write builds no manuscript on them.
+
+At startup, Analyze asks the governor which models it allows. It then sends a
+tiny test request to each model it plans to use. The analyst uses the
+synthesis role. That role uses Sonnet 5.5, or Sonnet 4.6 if 5.5 is not allowed.
+The methods critic uses the reasoning role. That role uses Opus 5.5, then
+another Opus such as Opus 4.7, then Sonnet 5.5. If no allowed model is strong
+enough for a role, the stage stops at startup.
+
+Sometimes the governor refuses a model partway through a run. When that
+happens, the methods critic picks the next allowed model and tries again. It
+tries at most three times.
 
 The platform colocates a `llm-governor-proxy` sidecar in every
 LLM-enabled ECS task, so the user container doesn't see any AWS auth
@@ -37,12 +61,26 @@ plumbing. The Claude Agent SDK reads `ANTHROPIC_BASE_URL=http://localhost:8765`
 from env and routes all its API traffic through the sidecar, which
 bridges to the governor via `lambda:Invoke[WithResponseStream]`.
 
+The Agent SDK runs the Claude Code program inside this container. Claude Code
+never uses a Claude subscription or anyone's Claude login. It signs in only
+with settings it finds in the environment. On the platform, it goes through the
+sidecar. When you run it yourself, it uses your own AWS profile or API key, as
+described below.
+
 ## Run locally
 
 Requires:
-- `LLM_GOVERNOR_FUNCTION_NAME` for model discovery and direct critic calls
-- `ANTHROPIC_BASE_URL` pointed at a running `llm-governor-proxy` instance for
-  the Claude Agent SDK analyst
+- A way to reach the models. The `VP_LLM_BACKEND` setting chooses it. The
+  [pennsieve-ai-utils README](https://github.com/Pennsieve/pennsieve-ai-utils#llm-client)
+  explains the choices.
+  - With `governor`, the default, set `LLM_GOVERNOR_FUNCTION_NAME`. The stage
+    uses it to find the allowed models and to call the methods critic. Also set
+    `ANTHROPIC_BASE_URL` to a running `llm-governor-proxy`. The analyst's Claude
+    Code session sends its requests there.
+  - With `bedrock`, set `AWS_REGION` and an AWS profile or AWS keys. The stage
+    then tells Claude Code to use Bedrock by itself. Claude Code also makes
+    small requests in the background. The stage sends those to the `bulk`
+    model.
 - `INPUT_DIR` with a `blackboard.json` produced by Hypothesize
 - `OUTPUT_DIR` writable
 
@@ -55,6 +93,15 @@ EXECUTION_RUN_ID=local-dev \
 LLM_GOVERNOR_FUNCTION_NAME=your-governor-lambda-name \
 ANTHROPIC_BASE_URL=http://localhost:8765 \
 python -m analyze.main
+
+# Or call Bedrock directly. Name the model for every role.
+INPUT_DIR=/tmp/hypothesize-output \
+OUTPUT_DIR=/tmp/analyze-output \
+VP_LLM_BACKEND=bedrock AWS_PROFILE=pennsieve-bedrock AWS_REGION=us-east-1 \
+VP_MODEL_REASONING=us.anthropic.claude-opus-5-5 \
+VP_MODEL_SYNTHESIS=us.anthropic.claude-sonnet-5-5 \
+VP_MODEL_BULK=us.anthropic.claude-haiku-4-5-20251001-v1:0 \
+python -m analyze.main
 ```
 
 ## Config
@@ -65,30 +112,38 @@ python -m analyze.main
 | `OUTPUT_DIR` | `/mnt/efs/output` | Where we write updated blackboard + per-hypothesis workdirs |
 | `EXECUTION_RUN_ID` | `local-dev` | Platform-injected run id (cost attribution) |
 | `WORKFLOW_INSTANCE_ID` | `local-dev` | Platform-injected workflow execution identifier |
-| `LLM_GOVERNOR_FUNCTION_NAME` | _(required)_ | Governor Lambda used for discovery, preflight, and direct critic calls |
-| `ANTHROPIC_BASE_URL` | _(required)_ | Sidecar URL (`http://localhost:8765` in production) |
-| `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze |
+| `VP_LLM_BACKEND` | `governor` | This chooses where model requests go. Use `bedrock` or `anthropic` only for local testing. |
+| `LLM_GOVERNOR_FUNCTION_NAME` | _(required for `governor`)_ | Governor Lambda used for discovery, preflight, and direct critic calls |
+| `ANTHROPIC_BASE_URL` | _(required for `governor`)_ | Sidecar URL (`http://localhost:8765` in production) |
+| `AWS_REGION` | _(required for `bedrock`)_ | This is the Bedrock region. Claude Code does not read the region from your AWS profile, so you must set it here. |
+| `VP_MODEL_BULK` | chosen at startup | On `bedrock` or `anthropic`, Claude Code uses this model for its small background requests. |
+| `VP_LOG_LLM_IO` | unset | Set this to `1` to save model requests and responses word for word. The methods critic's requests go to `llm-io.analyze.jsonl`. The file `agent-events.jsonl` becomes a full record of the Claude Code session. |
+| `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze. Raise it to test several in one run; each that passes is written up, and the rest are recorded as not testable or unresolved. |
+| `VP_ANALYZE_HYPOTHESIS_IDS` | unset | A comma-separated list of hypothesis IDs to analyze, in order, instead of taking the top `VP_ANALYZE_TOP_N`. Each ID must be accepted at the final iteration. Use it to reach a specific accepted hypothesis when the first one is not testable. |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
 | `VP_ANALYZE_MAX_METHODS_ITERS` | `3` | Maximum analyst/critic passes before an unresolved methods review fails the stage |
+| `VP_ANALYZE_STAGE_FILES` | `12` | How many of the seed dataset's data files to download before the analyst starts |
+| `VP_ANALYZE_STAGE_MAX_MB` | `200` | Total size budget, in MiB, for that pre-download |
+| `VP_ANALYZE_STAGE_DATA` | unset | Set to `0` to write only the file index and download nothing |
 | `VP_MODEL_SONNET` | dynamically resolved | Explicit pin for the Agent SDK analyst's model role |
 | `VP_ANALYZE_MODEL` | unset | Backward-compatible alias for `VP_MODEL_SONNET`; conflicting pins fail preflight |
 | `VP_MODEL_OPUS` | dynamically resolved | Explicit pin for the methods critic's reasoning role |
-| `VP_LLM_MAX_RETRIES` | `1` | Anthropic SDK retries within each direct routed attempt |
+| `VP_LLM_MAX_RETRIES` | `1` on the governor, `4` on `bedrock` or `anthropic` | How many times the Anthropic SDK retries a failed request. The governor keeps one retry, because each of its timeouts already takes a minute. Direct backends retry more, to ride out short network dropouts. |
 
 ## Pennsieve Test smoke check
 
 Before the analyst starts, a healthy run prints the effective allow-list and
-both concrete assignments. In the previously observed Test configuration the
-important lines were:
+the model chosen for each role. If the governor allows the 5.5 models, the
+important lines look like this:
 
 ```text
 --- LLM preflight ---
-  assignments:
-    opus    (reasoning) -> us.anthropic.claude-sonnet-4-6 [ranked]
-    sonnet  (analysis)  -> us.anthropic.claude-sonnet-4-6 [ranked]
+  role assignments:
+    reasoning  → us.anthropic.claude-opus-5-5 (rank 355)  [ranked]
+    synthesis  → us.anthropic.claude-sonnet-5-5 (rank 255)  [ranked]
 
-[agent] hypothesis H1: model=us.anthropic.claude-sonnet-4-6 ...
-[llm] → methods_critic logical=opus model=us.anthropic.claude-sonnet-4-6 attempt=1/3 ...
+[agent] hypothesis H1: model=us.anthropic.claude-sonnet-5-5 ...
+[llm] → methods_critic  role=opus  model=us.anthropic.claude-opus-5-5 ...
 ```
 
 Successful completion may include several analyst/critic passes. It logs

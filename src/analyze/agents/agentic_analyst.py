@@ -10,10 +10,14 @@ session with Read/Write/Edit/Bash tools that:
   5. Returns only after a successful SDK result and a cleanly executed
      notebook; turn-budget exhaustion is a stage failure.
 
-Auth model: the Claude Agent SDK reads `ANTHROPIC_BASE_URL` from env
-(set by the platform to `http://localhost:8765` — the in-task sidecar).
-The sidecar bridges to the LLM governor via `lambda:InvokeWithResponseStream`.
-We don't configure auth here.
+Auth model: the Agent SDK starts the Claude Code CLI inside this container.
+It never uses anyone's Claude subscription or login; it authenticates only
+from environment variables. On the platform (`VP_LLM_BACKEND=governor`) it
+reads `ANTHROPIC_BASE_URL`, set by the platform to `http://localhost:8765`, the
+in-task sidecar that bridges to the LLM governor via
+`lambda:InvokeWithResponseStream`. For local runs, `VP_LLM_BACKEND=bedrock`
+switches it to Bedrock with the caller's AWS credentials, and `anthropic` to
+the Anthropic API with `ANTHROPIC_API_KEY` (see `pennsieve_ai_utils.backend`).
 
 Scaffold-stage notes:
   - The full prototype in `virtual-postdoc` carries SPARC-specific dataset
@@ -32,11 +36,24 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pennsieve_ai_utils.backend import claude_code_env, llm_backend
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
+from pennsieve_ai_utils.llm import raw_io_enabled
+
+from analyze import data_staging
 
 # Maximum agent turns. Generous so the agent has room to iterate on
 # real-world data quirks; the agent should self-terminate well before.
 MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
+
+# The pennsieve-mcp server, when the run provides one (VP_PENNSIEVE_MCP_URL).
+# Claude Code names its tools mcp__<server>__<tool>.
+MCP_SERVER = "pennsieve"
+MCP_TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
+
+# Tool results are cut to this many characters in the trace, unless
+# VP_LOG_LLM_IO=1 asks for the full transcript.
+TRACE_RESULT_CHARS = 8000
 
 
 async def run(
@@ -45,8 +62,16 @@ async def run(
     *,
     workdir: Path,
     model_id: str,
+    background_model: str = "",
+    usage_log: list[dict] | None = None,
 ) -> None:
-    """Drive one analyst session against one hypothesis."""
+    """Drive one analyst session against one hypothesis.
+
+    `background_model` serves Claude Code's own small background calls on a
+    direct backend; the governor path leaves that to the platform.
+    `usage_log` is the stage's usage list (`LLMClient.usage_log`); the
+    session's token counts are added to it as one `agent_sdk_result` row.
+    """
     try:
         from claude_agent_sdk import (
             ClaudeAgentOptions,
@@ -69,7 +94,12 @@ async def run(
     hyp_workdir = (workdir / "hypotheses" / hypothesis.id).resolve()
     hyp_workdir.mkdir(parents=True, exist_ok=True)
 
-    task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir)
+    # Download the dataset's file index and a sample before the agent starts,
+    # through the public Discover route. Raises DataStagingError if the
+    # dataset cannot be reached, so the stage stops instead of guessing.
+    staging = data_staging.stage(bb, hypothesis, hyp_workdir)
+    mcp_url = os.environ.get("VP_PENNSIEVE_MCP_URL", "").strip()
+    task_prompt = _build_task_prompt(bb, hypothesis, hyp_workdir, staging)
     print(
         f"  [agent] hypothesis {hypothesis.id}: model={model_id} cwd={hyp_workdir}",
         flush=True,
@@ -80,15 +110,20 @@ async def run(
     async def _allow_all(tool_name, tool_input, context):
         if tool_name in {"Read", "Write", "Edit", "Bash", "NotebookEdit"}:
             return PermissionResultAllow()
+        if mcp_url and tool_name.startswith(MCP_TOOL_PREFIX):
+            return PermissionResultAllow()
         return PermissionResultDeny(message="Tool is not enabled for this analysis")
 
     options = ClaudeAgentOptions(
+        # The pennsieve-mcp server's public Discover tools, when the run provides one.
+        mcp_servers={MCP_SERVER: {"type": "http", "url": mcp_url}} if mcp_url else {},
         model=model_id,
         max_turns=MAX_TURNS,
         # Broad allowed_tools entries bypass can_use_tool in the SDK.
         # Leave approval to the callback; cwd is not a security boundary.
         can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
+        env=claude_code_env(background_model),
     )
 
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -111,7 +146,12 @@ async def run(
             trace.write(text + "\n")
         return json.loads(text)
 
-    event("start", model=model_id, max_turns=MAX_TURNS)
+    # With VP_LOG_LLM_IO=1 the trace is a full transcript: the task prompt,
+    # every text and thinking block, untruncated tool results, and per-turn
+    # usage. Claude Code's own system prompt is not exposed by the SDK.
+    raw = raw_io_enabled()
+    event("start", model=model_id, max_turns=MAX_TURNS,
+          **({"prompt": task_prompt} if raw else {}))
 
     try:
         async with ClaudeSDKClient(options=options) as client:
@@ -131,11 +171,20 @@ async def run(
                                   f"{block.name} id={getattr(block, 'id', '?')} "
                                   f"{str(detail).replace(chr(10), ' ')[:160]}", flush=True)
                         elif hasattr(block, "tool_use_id"):
+                            result = str(getattr(block, "content", ""))
                             event("tool_result", tool_use_id=block.tool_use_id,
                                   is_error=getattr(block, "is_error", False),
-                                  content=str(getattr(block, "content", ""))[:8000])
+                                  content=result if raw else result[:TRACE_RESULT_CHARS])
+                        elif hasattr(block, "thinking"):
+                            if raw:
+                                event("thinking", text=block.thinking)
                         elif hasattr(block, "text"):
                             final_text = block.text
+                            if raw:
+                                event("text", text=block.text)
+                usage = getattr(msg, "usage", None)
+                if raw and usage and not hasattr(msg, "is_error"):
+                    event("turn_usage", model=getattr(msg, "model", None), usage=usage)
                 cost = getattr(msg, "total_cost_usd", None)
                 if cost is not None:
                     total_cost = max(total_cost, float(cost))
@@ -143,6 +192,9 @@ async def run(
                     event("result", subtype=getattr(msg, "subtype", ""),
                           is_error=msg.is_error, cost_usd=total_cost,
                           usage=getattr(msg, "usage", {}))
+                    _record_sdk_usage(usage_log, hypothesis.id, model_id,
+                                      getattr(msg, "usage", None) or {}, total_cost,
+                                      len(tools_called), getattr(msg, "num_turns", None))
                     if msg.is_error or getattr(msg, "subtype", "") != "success":
                         raise RuntimeError(f"Agent did not complete: {getattr(msg, 'subtype', '?')}")
                     completed = True
@@ -150,6 +202,14 @@ async def run(
         if not completed or not final_text.strip():
             raise RuntimeError("Agent ended without a successful result and summary")
         validate_notebook(hyp_workdir / "analysis.ipynb")
+        check_analysis_status(hyp_workdir)
+    except NotTestable as e:
+        hypothesis.analysis_cost_usd += total_cost
+        hypothesis.analysis_tools_called.extend(tools_called)
+        hypothesis.analysis_workdir = str(hyp_workdir.relative_to(workdir.resolve().parent))
+        hypothesis.analysis_summary = final_text[:8000]
+        bb.log("agentic_analyst", "not_testable", f"hypothesis {hypothesis.id}: {e}")
+        raise
     except Exception as e:
         hypothesis.analysis_cost_usd += total_cost
         hypothesis.analysis_tools_called.extend(tools_called)
@@ -177,7 +237,42 @@ async def run(
     )
 
 
-def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) -> str:
+def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, tools, turns) -> None:
+    """Add the analyst session's token counts to the stage usage log.
+
+    The Agent SDK reports the session's total usage on its result message.
+    Only token counts are stored, under the same field names as the other
+    usage rows, so cost can be worked out later from a price table. The SDK's
+    own `total_cost_usd` comes from Claude Code's built-in Anthropic list
+    prices, not Bedrock's; it is kept, labeled as the SDK's figure, so the two
+    can be compared.
+    """
+    if usage_log is None:
+        return
+
+    def count(key):
+        value = sdk_usage.get(key) if isinstance(sdk_usage, dict) else getattr(sdk_usage, key, 0)
+        return int(value or 0)
+
+    usage_log.append({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event": "agent_sdk_result",
+        "agent": "agentic_analyst",
+        "hypothesis_id": hypothesis_id,
+        "backend": llm_backend(),
+        "model_id": model_id,
+        "input_tokens": count("input_tokens"),
+        "output_tokens": count("output_tokens"),
+        "cache_creation_input_tokens": count("cache_creation_input_tokens"),
+        "cache_read_input_tokens": count("cache_read_input_tokens"),
+        "tools_called": tools,
+        "turns": turns,
+        "sdk_reported_cost_usd": float(sdk_cost),
+    })
+
+
+def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path,
+                       staging: data_staging.StagingResult | None = None) -> str:
     """Render the initial task prompt the analyst receives. Kept minimal in
     the scaffold; the prototype version is far richer (per-dataset blocks,
     role sequences for cross-dataset hypotheses, narrowed-claim handling).
@@ -187,14 +282,21 @@ def _build_task_prompt(bb: Blackboard, hypothesis: Hypothesis, workdir: Path) ->
     revision = ("\n## Required methods revisions\nRevise the existing notebook and re-execute ALL cells.\n"
                 + json.dumps(hypothesis.methods_critique, indent=2)
                 if hypothesis.methods_critique else "")
+    data_access = data_staging.prompt_section(staging) if staging else ""
+    if os.environ.get("VP_PENNSIEVE_MCP_URL", "").strip():
+        data_access += "\n\n" + PENNSIEVE_TOOLS_SECTION
     return f"""You are running a single analysis to test one hypothesis.
 
 You have Read, Write, Edit, and Bash tools. Use Bash to run Python:
 `{venv_python}` has pandas, scipy, statsmodels, matplotlib, papermill,
-nbformat, jupytext, httpx, and openpyxl pre-installed.
+nbformat, jupytext, httpx, openpyxl and flowio pre-installed. Use flowio to
+read FCS files. Its `text` dictionary includes the `$SPILL` matrix; apply it
+to compensate the fluorescence channels before gating.
 
 If you need a package that's not pre-installed (e.g., `lifelines`,
 `pynwb`, `nibabel`), install it with `pip install --user <package>`.
+Do not install anything that upgrades or downgrades numpy, pandas or scipy;
+other cells and the methods review depend on the installed versions.
 The `--user` flag is required because this container runs without
 root privileges; standard `pip install` will fail.
 
@@ -205,14 +307,25 @@ root privileges; standard `pip install` will fail.
 **Rationale:** {hypothesis.rationale}
 {revision}
 
+{data_access}
+
 ## Datasets available
 
 {datasets_block}
 
 ## Your task
 
-1. Inspect the dataset(s) named in the hypothesis. Look at actual columns,
-   dtypes, NaN rates — do NOT assume schema from the title alone.
+1. Check that the deposit can test the claim before analyzing anything. Find
+   the folders that hold the claim's outcome measurement and confirm they
+   measure it directly, for the samples, conditions and replicates the claim
+   needs. A staining panel is not a functional assay; a folder that covers 3
+   clones cannot test a 12-clone claim. When the Pennsieve tools are
+   available, call `describe_discover_folder` on each folder you plan to use.
+   If the deposit cannot test the claim as stated, do not substitute a proxy:
+   write a short notebook that documents the check, and report the status
+   `not_testable` (step 5).
+   Then inspect the data itself. Look at actual columns, dtypes, NaN rates —
+   do NOT assume schema from the title alone.
 2. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
    end-to-end: load → preprocess → analysis → conclusion.
 3. Run it via papermill. Fix errors iteratively.
@@ -222,6 +335,20 @@ root privileges; standard `pip install` will fail.
 4. When the notebook runs cleanly, write a short summary of what you
    found and whether the claim is supported, partially supported, or
    not supported by the data. Be honest about assumptions and limits.
+5. Write `{STATUS_FILE}` in your working directory, as JSON:
+   `{{"status": "tested", "data_files": ["data/files/...", ...]}}` when the
+   notebook analyzed the deposit's data, listing every data file it read.
+   Each entry is a path relative to your working directory. A glob such as
+   `data/files/DATA/sub-*/derivatives/electrodes.tsv` is fine when you read
+   many files of the same shape, as long as it matches files that are really
+   there. Or
+   `{{"status": "not_testable", "reason": "<what the deposit lacks>", "data_files": [...]}}`
+   when the deposit cannot test the claim as stated (step 1), listing the
+   files you checked, or
+   `{{"status": "blocked", "blocker": "<what stopped you>", "data_files": []}}`
+   when you could not reach or read the data. Both are valid, honest
+   outcomes. Never report "tested" for an analysis that did not read the
+   deposit's data.
 
 Your working directory is `{workdir}`. Write all files there.
 """
@@ -234,8 +361,6 @@ def _format_datasets_brief(bb: Blackboard) -> str:
     for d in bb.dataset_summaries:
         out.append(
             f"- **{d.id}**: {d.title}\n"
-            f"  - Bucket: {d.bucket_uri or '(none)'}\n"
-            f"  - Access: {d.access_type or 'unknown'}\n"
             f"  - {d.description[:300]}"
             f"\n  - Repository URL: {d.url}"
             f"\n  - README: {d.readme[:1500]}"
@@ -243,6 +368,101 @@ def _format_datasets_brief(bb: Blackboard) -> str:
             f"\n  - Record tables: {json.dumps(d.record_tables)[:3000]}"
         )
     return "\n".join(out)
+
+
+STATUS_FILE = "analysis_status.json"
+
+
+class NotTestable(RuntimeError):
+    """The deposit cannot test the hypothesis as stated. An honest outcome,
+    recorded on the hypothesis; it is not an analysis failure."""
+
+PENNSIEVE_TOOLS_SECTION = """## Pennsieve tools
+
+You also have Pennsieve tools for published datasets. They are public and need no login:
+
+- `find_discover_files`: search every file of a dataset by path pattern
+  (`*` within a folder, `**` across folders) or file type. Use it instead of
+  opening folders one by one.
+- `describe_discover_folder`: what the FCS or EDF files in one folder record
+  (channel layouts, stains or sampling rates, event counts) and the distinct
+  sample names in it. Use it to check that a planned test's channels,
+  conditions and samples exist before writing the notebook.
+- `summarize_discover_table`: the columns, guessed types and first rows of a
+  CSV or TSV file.
+- `list_discover_files`: the files in one folder of a dataset. Each file has a
+  `download_path`; pass it to the other tools.
+- `read_discover_file_headers`: what an FCS or EDF file records (channel names
+  and stains, or signal labels and sampling rates), without downloading it.
+  Use it to check that the channels or signals your test needs exist.
+- `preview_discover_file`: the first part of a text file, such as a TSV or CSV.
+- `get_discover_file_link`: a short-lived download link for one file.
+- `get_discover_dataset`, `search_discover_datasets`, `lookup_citation`: dataset
+  metadata, other published datasets, and DOI lookups.
+
+Download the files your notebook analyzes into `data/` with the download
+command above, so the notebook can be run again."""
+
+
+def check_analysis_status(workdir: Path) -> dict:
+    """Require the analyst's own report that it analyzed the deposit's data.
+
+    A notebook can run cleanly and still analyze nothing, for example when it
+    only reports that the data could not be downloaded. The analyst writes
+    `analysis_status.json`; this raises unless the status is "tested" and every
+    data file it lists exists in the working directory.
+    """
+    path = workdir / STATUS_FILE
+    if not path.is_file():
+        raise RuntimeError(f"the analyst did not write {STATUS_FILE}")
+    try:
+        status = json.loads(path.read_text())
+    except ValueError as exc:
+        raise RuntimeError(f"{STATUS_FILE} is not valid JSON: {exc}") from exc
+    if status.get("status") == "not_testable":
+        raise NotTestable(status.get("reason") or "(no reason given)")
+    if status.get("status") == "blocked":
+        raise RuntimeError(f"the analyst reported the analysis as blocked: "
+                           f"{status.get('blocker') or '(no reason given)'}")
+    if status.get("status") != "tested":
+        raise RuntimeError(f"{STATUS_FILE} has status {status.get('status')!r}; expected 'tested'")
+    files = status.get("data_files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError(f"{STATUS_FILE} lists no data files that the analysis read")
+    missing = [f for f in files if not _entry_matches_a_file(workdir, f)]
+    if missing:
+        raise RuntimeError(f"{STATUS_FILE} lists data files that are not in {workdir}: "
+                           + ", ".join(map(str, missing[:5])))
+    return status
+
+
+# A trailing note after a path, such as "sub-*/electrodes.tsv (all 29 subjects)".
+_TRAILING_NOTE = re.compile(r"\s*\([^()]*\)\s*$")
+
+
+def _entry_matches_a_file(workdir: Path, entry: str) -> bool:
+    """Does one `data_files` entry name at least one real file under `workdir`?
+
+    The check exists so the analyst cannot claim data it never read, so every
+    entry must still resolve to a file that is really there. The entry itself
+    may be written in any form an analyst reasonably reaches for: a plain path,
+    a glob covering many subjects, or either of those followed by a note in
+    brackets. A run on `pennsieve:530` failed on
+    `data/files/DATA/sub-*/derivatives/electrodes.tsv (all 29 subjects)`, which
+    was a true statement about 29 files that were present.
+    """
+    text = _TRAILING_NOTE.sub("", str(entry)).strip()
+    if not text:
+        return False
+    root = workdir.resolve()
+
+    def inside_and_real(path: Path) -> bool:
+        resolved = path.resolve()
+        return resolved.is_relative_to(root) and resolved.is_file()
+
+    if any(ch in text for ch in "*?["):
+        return any(inside_and_real(match) for match in workdir.glob(text))
+    return inside_and_real(workdir / text)
 
 
 def validate_notebook(path: Path) -> None:
