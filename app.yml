@@ -1,0 +1,108 @@
+# yaml-language-server: $schema=https://schemas.pennsieve.io/app-manifest/v1.json
+application:
+  name: AI Analyze
+  description: >-
+    Stage 3 of the pennsieve-ai research pipeline. Reads the blackboard from
+    Hypothesize and, for each selected accepted hypothesis, has a Claude Code
+    agent write and run a Jupyter notebook that tests it against the seed
+    dataset, reviewed by a methods critic; writes the updated blackboard,
+    notebooks and logs for the Write stage.
+  type: processor
+  tags:
+    - ai
+    - llm
+    - analysis
+    - notebook
+    - hypothesis
+
+runtime:
+  computeTypes:
+    - standard
+  # Calls Claude through the Pennsieve LLM governor: LLM access is opt-in.
+  llm: true
+
+parameters:
+  - name: VP_ANALYZE_TOP_N
+    label: Hypotheses to analyze
+    description: How many accepted hypotheses from the final Hypothesize iteration to analyze, in order. Ignored when VP_ANALYZE_HYPOTHESIS_IDS is set.
+    type: integer
+    defaultValue: 1
+    min: 1
+  - name: VP_ANALYZE_HYPOTHESIS_IDS
+    label: Hypothesis IDs
+    description: Comma-separated hypothesis IDs to analyze, in order, instead of the top N. Each must be accepted at the final iteration. Leave empty to use VP_ANALYZE_TOP_N.
+    type: string
+    required: false
+  - name: VP_ANALYZE_MAX_TURNS
+    label: Agent turn budget
+    description: Maximum number of turns the Claude Code analyst may take per hypothesis.
+    type: integer
+    defaultValue: 80
+    min: 1
+  - name: VP_ANALYZE_MAX_METHODS_ITERS
+    label: Methods review rounds
+    description: Maximum analyst/methods-critic passes before an unresolved methods review ends the stage.
+    type: integer
+    defaultValue: 3
+    min: 1
+  - name: VP_ANALYZE_STAGE_DATA
+    label: Pre-download data
+    description: "1 downloads a sample of the seed dataset's files before the analyst starts; 0 writes only the file index."
+    type: string
+    defaultValue: "1"
+    validValues:
+      - "1"
+      - "0"
+  - name: VP_ANALYZE_STAGE_FILES
+    label: Files to pre-download
+    description: How many of the seed dataset's data files to download before the analyst starts.
+    type: integer
+    defaultValue: 12
+    min: 0
+  - name: VP_ANALYZE_STAGE_MAX_MB
+    label: Pre-download size budget (MiB)
+    description: Total size budget, in MiB, for the pre-downloaded files.
+    type: number
+    defaultValue: 200
+    min: 0
+  - name: VP_PENNSIEVE_MCP_URL
+    label: Pennsieve MCP URL
+    description: URL of a pennsieve-mcp server; when set, the analyst also gets its Discover tools.
+    type: string
+    required: false
+  - name: VP_MODEL_REASONING
+    label: Reasoning model
+    description: Pins the model for the methods critic (reasoning role). Leave empty to choose the strongest model the governor allows.
+    type: string
+    required: false
+  - name: VP_MODEL_SYNTHESIS
+    label: Analyst model
+    description: Pins the model for the Claude Code analyst (synthesis role). Leave empty to choose automatically.
+    type: string
+    required: false
+  - name: VP_MODEL_OPUS
+    label: Reasoning model (legacy name)
+    description: Older name for VP_MODEL_REASONING, still honored.
+    type: string
+    required: false
+  - name: VP_MODEL_SONNET
+    label: Analyst model (legacy name)
+    description: Older name for VP_MODEL_SYNTHESIS, still honored.
+    type: string
+    required: false
+  - name: VP_ANALYZE_MODEL
+    label: Analyst model (legacy alias)
+    description: Older alias for VP_MODEL_SYNTHESIS, still honored; conflicting pins fail at startup.
+    type: string
+    required: false
+  - name: VP_LLM_MAX_RETRIES
+    label: LLM request retries
+    description: How many times a failed model request is retried. Leave empty for the default (1 through the governor).
+    type: integer
+    required: false
+    min: 0
+  - name: VP_LOG_LLM_IO
+    label: Log model I/O
+    description: Save model requests and responses word for word (llm-io.analyze.jsonl, and a full agent-events.jsonl transcript).
+    type: boolean
+    defaultValue: false
