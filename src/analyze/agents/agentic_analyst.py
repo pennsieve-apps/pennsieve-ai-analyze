@@ -39,6 +39,7 @@ from pathlib import Path
 from pennsieve_ai_utils.backend import claude_code_env, llm_backend
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 from pennsieve_ai_utils.llm import raw_io_enabled
+from pennsieve_ai_utils.models import OPUS_FALLBACKS
 
 from analyze import data_staging
 
@@ -51,22 +52,24 @@ MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
 MCP_SERVER = "pennsieve"
 MCP_TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
 
-# The analyst's model when its first model refuses the task. Opus 4.7 has not
-# refused any of the pipeline's datasets; Opus 5.5 refused seed 405.
-DEFAULT_ANALYST_FALLBACK = "us.anthropic.claude-opus-4-7"
+# The analyst's models when its first model refuses the task: the shared
+# Opus chain, newest first. Opus 5.5 refused seed 405; the older Opus models
+# have not refused any of the pipeline's datasets.
+DEFAULT_ANALYST_FALLBACKS = OPUS_FALLBACKS
 
 
-def analyst_fallbacks(model_id: str) -> list[str]:
+def analyst_fallbacks(model_id: str, can_invoke=None) -> list[str]:
     """Models to try, in order, after `model_id` refuses the task.
 
     `VP_ANALYZE_FALLBACK_MODEL` is a comma-separated list that replaces the
-    default; `none` turns the fallback off.
+    default; `none` turns the fallback off. With `can_invoke` (usually
+    `LLMClient.can_invoke`), models the account cannot call are dropped.
     """
     configured = os.environ.get("VP_ANALYZE_FALLBACK_MODEL", "").strip()
     if configured.lower() in ("none", "off"):
         return []
-    models = [m.strip() for m in configured.split(",") if m.strip()] or [DEFAULT_ANALYST_FALLBACK]
-    return [m for m in models if m != model_id]
+    models = [m.strip() for m in configured.split(",") if m.strip()] or list(DEFAULT_ANALYST_FALLBACKS)
+    return [m for m in models if m != model_id and (can_invoke is None or can_invoke(m))]
 
 
 # Tool results are cut to this many characters in the trace, unless
@@ -81,6 +84,7 @@ async def run(
     workdir: Path,
     model_id: str,
     background_model: str = "",
+    can_invoke=None,
     usage_log: list[dict] | None = None,
 ) -> None:
     """Drive one analyst session against one hypothesis.
@@ -144,7 +148,8 @@ async def run(
         can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
         env=claude_code_env(background_model),
-        fallback_model=",".join(analyst_fallbacks(model_id)) or None,
+        # Claude Code takes one fallback, for a model that is overloaded or unavailable.
+        fallback_model=next(iter(analyst_fallbacks(model_id, can_invoke)), None),
     )
 
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")

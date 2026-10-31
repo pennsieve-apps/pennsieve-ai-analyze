@@ -136,8 +136,8 @@ python -m analyze.main
 | `AWS_REGION` | _(required for `bedrock`)_ | This is the Bedrock region. Claude Code does not read the region from your AWS profile, so you must set it here. |
 | `VP_MODEL_BULK` | chosen at startup | On `bedrock` or `anthropic`, Claude Code uses this model for its small background requests. |
 | `VP_LOG_LLM_IO` | unset | Set this to `1` to save model requests and responses word for word. The methods critic's requests go to `llm-io.analyze.jsonl`. The file `agent-events.jsonl` becomes a full record of the Claude Code session. |
-| `VP_ANALYZE_TOP_N` | `1` | How many of the best-ranked accepted hypotheses from the final iteration to analyze. Raise it to test several in one run; each that passes is written up, and the rest are recorded as not testable or unresolved. |
-| `VP_ANALYZE_MAX_ATTEMPTS` | `VP_ANALYZE_TOP_N` + 1 | The most hypotheses Analyze will try, counting fallbacks. Each try is a full analyst session, so this caps the spending. Set it equal to `VP_ANALYZE_TOP_N` to turn the fallback off. |
+| `VP_ANALYZE_TOP_N` | `all` | How many of the best-ranked accepted hypotheses from the final iteration to analyze. `all` tests every accepted hypothesis, as the prototype did. A number tests only the best-ranked ones; each that passes is written up, and the rest are recorded as not testable or unresolved. |
+| `VP_ANALYZE_MAX_ATTEMPTS` | all accepted, or `VP_ANALYZE_TOP_N` + 1 | The most hypotheses Analyze will try, counting fallbacks. Each try is a full analyst session, so this caps the spending. Set it equal to `VP_ANALYZE_TOP_N` to turn the fallback off. |
 | `VP_ANALYZE_HYPOTHESIS_IDS` | unset | A comma-separated list of hypothesis IDs to analyze, in order, instead of taking the best-ranked `VP_ANALYZE_TOP_N`. It overrides the ranking, and there is no fallback. Each ID must be accepted at the final iteration. Use it to reach a specific accepted hypothesis when the top-ranked one is not testable. |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
 | `VP_ANALYZE_MAX_METHODS_ITERS` | `3` | Maximum analyst/critic passes before an unresolved methods review fails the stage |

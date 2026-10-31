@@ -38,7 +38,7 @@ def test_analyze_targets_final_iteration_hypothesis(monkeypatch, tmp_path):
     background_models = []
     critic_calls = []
 
-    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model="", usage_log=None):
+    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
         analyst_calls.append((hypothesis, workdir, model_id))
         background_models.append(background_model)
         hypothesis.analysis_workdir = "hypotheses/H1"
@@ -93,7 +93,7 @@ def test_methods_revision_loop_is_bounded_and_snapshotted(monkeypatch, tmp_path,
     h = _hypothesis(1)
     bb = Blackboard("q", "dataset", hypotheses=[h], critic_reviews=[_review(1)])
     seen = []
-    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
         seen.append(dict(hyp.methods_critique))
         folder = workdir / "hypotheses" / hyp.id
         folder.mkdir(parents=True, exist_ok=True)
@@ -119,7 +119,7 @@ def test_direct_backend_passes_a_background_model(monkeypatch, tmp_path):
                     iterations_completed=1, hypotheses=[hyp], critic_reviews=[_review(1)])
     seen = []
 
-    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model="", usage_log=None):
+    async def fake_analyst(bb, hypothesis, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
         seen.append(background_model)
         folder = workdir / "hypotheses" / hypothesis.id
         folder.mkdir(parents=True, exist_ok=True)
@@ -147,7 +147,7 @@ def _loop(monkeypatch, tmp_path, issues, analyst_raises=None):
     bb = Blackboard("q", "dataset", hypotheses=[h], critic_reviews=[_review(1)])
     rounds = []
 
-    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
         rounds.append(1)
         folder = workdir / "hypotheses" / hyp.id
         folder.mkdir(parents=True, exist_ok=True)
@@ -296,6 +296,17 @@ def test_list_order_breaks_a_full_tie(monkeypatch):
     assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H2", "H3"]
 
 
+def test_by_default_every_accepted_hypothesis_is_tested(monkeypatch):
+    """As in the prototype: no cap, and none is left over to fall back on."""
+    monkeypatch.delenv("VP_ANALYZE_TOP_N", raising=False)
+    monkeypatch.delenv("VP_ANALYZE_MAX_ATTEMPTS", raising=False)
+    bb = Blackboard("q", "s", iterations_completed=3,
+                    hypotheses=[_hyp("H2"), _hyp("H3"), _hyp("H5")],
+                    critic_reviews=[_accept("H2"), _accept("H3")])
+    queue, wanted = pipeline._analysis_queue(bb)
+    assert [h.id for h in queue] == ["H2", "H3"] and wanted == 2
+
+
 def test_named_ids_override_the_ranking(monkeypatch):
     monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_IDS", "H1")
     bb = Blackboard("q", "s", iterations_completed=3,
@@ -317,7 +328,7 @@ def _run_with(monkeypatch, tmp_path, bb, untestable=()):
     testable and a critic that passes everything else. Returns the IDs tried."""
     tried = []
 
-    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
         tried.append(hyp.id)
         folder = workdir / "hypotheses" / hyp.id
         folder.mkdir(parents=True, exist_ok=True)
@@ -374,7 +385,7 @@ def _refusing_run(monkeypatch, tmp_path, bb, refusing_models):
     (hypothesis ID, model) for each analyst call."""
     calls = []
 
-    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
         calls.append((hyp.id, model_id))
         if model_id in refusing_models:
             raise pipeline.agentic_analyst.AnalystRefused(model_id)

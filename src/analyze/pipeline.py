@@ -51,7 +51,8 @@ def _analysis_queue(bb: Blackboard) -> tuple[list, int]:
     their IDs across iterations, so selecting from the final slate ensures
     Write later reads the same record that Analyze updates.
 
-    `VP_ANALYZE_TOP_N` sets how many should pass. When one turns out not
+    `VP_ANALYZE_TOP_N` sets how many should pass; the default, `all`, tests
+    every accepted hypothesis. With a number, when one turns out not
     testable or its methods review stays unresolved, the run moves on to the
     next-ranked hypothesis, up to `VP_ANALYZE_MAX_ATTEMPTS` tried in all
     (default one more than `VP_ANALYZE_TOP_N`). That cap bounds the spending.
@@ -80,10 +81,17 @@ def _analysis_queue(bb: Blackboard) -> tuple[list, int]:
                 f"iteration. Accepted and analyzable: {have}.")
         return [by_id[hid] for hid in wanted], len(wanted)
 
-    n = int(os.environ.get("VP_ANALYZE_TOP_N", "1"))
-    if n < 1:
-        raise ValueError("VP_ANALYZE_TOP_N must be at least 1")
-    attempts = int(os.environ.get("VP_ANALYZE_MAX_ATTEMPTS", str(n + 1)))
+    top_n = os.environ.get("VP_ANALYZE_TOP_N", "all").strip().lower() or "all"
+    if top_n == "all":
+        # Test every accepted hypothesis, as the prototype did; none is left to fall back on.
+        n = max(len(accepted), 1)
+        default_attempts = n
+    else:
+        n = int(top_n)
+        if n < 1:
+            raise ValueError("VP_ANALYZE_TOP_N must be at least 1, or 'all'")
+        default_attempts = n + 1
+    attempts = int(os.environ.get("VP_ANALYZE_MAX_ATTEMPTS", str(default_attempts)))
     if attempts < n:
         raise ValueError("VP_ANALYZE_MAX_ATTEMPTS must be at least VP_ANALYZE_TOP_N")
     ranked = [h for _, h in sorted(enumerate(accepted),
@@ -202,11 +210,13 @@ async def _run_analyst(bb: Blackboard, hyp, client, *, workdir: Path, model_id: 
     while True:
         try:
             await agentic_analyst.run(bb, hyp, workdir=workdir, model_id=model_id,
-                                      background_model=background_model, usage_log=usage_log)
+                                      background_model=background_model, usage_log=usage_log,
+                                      can_invoke=getattr(client, "can_invoke", None))
             return model_id
         except agentic_analyst.AnalystRefused:
             tried.append(model_id)
-            fallback = next((m for m in agentic_analyst.analyst_fallbacks(model_id)
+            fallback = next((m for m in agentic_analyst.analyst_fallbacks(
+                                 model_id, getattr(client, "can_invoke", None))
                              if m not in tried), None)
             if usage_log is not None:
                 usage_log.append({"event": "refusal", "agent": "agentic_analyst",

@@ -212,12 +212,14 @@ def test_a_refusal_in_the_session_raises_analyst_refused(monkeypatch, tmp_path, 
         asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="us.anthropic.claude-opus-5-5"))
     assert h.analysis_cost_usd == 0.2
     # Claude Code's own fallback is set too, for an overloaded or unavailable model.
-    assert seen["fallback"] == agentic_analyst.DEFAULT_ANALYST_FALLBACK
+    assert seen["fallback"] == agentic_analyst.DEFAULT_ANALYST_FALLBACKS[0]
 
 
 def test_the_fallback_list_skips_the_model_already_in_use(monkeypatch):
     monkeypatch.delenv("VP_ANALYZE_FALLBACK_MODEL", raising=False)
-    assert agentic_analyst.analyst_fallbacks(agentic_analyst.DEFAULT_ANALYST_FALLBACK) == []
+    chain = list(agentic_analyst.DEFAULT_ANALYST_FALLBACKS)
+    assert agentic_analyst.analyst_fallbacks(chain[0]) == chain[1:]
+    assert agentic_analyst.analyst_fallbacks("x", can_invoke=lambda m: m == chain[2]) == [chain[2]]
     monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "a, b")
     assert agentic_analyst.analyst_fallbacks("a") == ["b"]
     monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "none")
