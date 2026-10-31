@@ -449,7 +449,13 @@ You also have Pennsieve tools for published datasets. They are public and need n
   metadata, other published datasets, and DOI lookups.
 
 Download the files your notebook analyzes into `data/` with the download
-command above, so the notebook can be run again."""
+command above, so the notebook can be run again.
+
+Run that download in the foreground and wait for it, even when it takes
+minutes. Do not put it in the background and poll it with `sleep`: that spends
+your turns and your time budget on waiting. The download skips files already
+present at their published size, so if it is cut short, running the same
+command again resumes it rather than starting over."""
 
 
 def check_analysis_status(workdir: Path) -> dict:
