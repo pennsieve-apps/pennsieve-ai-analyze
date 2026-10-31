@@ -256,3 +256,153 @@ def test_a_named_id_that_was_not_accepted_is_refused(monkeypatch):
                     critic_reviews=[_accept("H2"), _accept("H3")])
     with pytest.raises(ValueError, match="H4.*not accepted"):
         pipeline._hypotheses_to_analyze(bb)
+
+
+def _scored(hid, novelty, plausibility, feasibility, alignment, attacks=(), iteration=3):
+    return CriticReview(hid, novelty, plausibility, feasibility, alignment,
+                        list(attacks), "accept", iteration)
+
+
+def test_the_best_scored_hypothesis_is_chosen_not_the_first_listed(monkeypatch):
+    """The final scores from run seed530-write: list order picked H4, but H6
+    ties it on novelty, plausibility and alignment and is more feasible."""
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "1")
+    ids = ["H4", "H1", "H2", "H3", "H6"]
+    bb = Blackboard("q", "pennsieve:530", iterations_completed=3,
+                    hypotheses=[_hyp(h) for h in ids],
+                    critic_reviews=[_scored("H4", 4, 3, 3, 5), _scored("H1", 3, 4, 3, 5),
+                                    _scored("H2", 4, 3, 3, 4), _scored("H3", 3, 3, 4, 4),
+                                    _scored("H6", 4, 3, 4, 5)])
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H6"]
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "5")
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H6", "H3", "H4", "H2", "H1"]
+    assert "chose H6, H3, H4, H2, H1 of 5 accepted" in bb.notebook[-1]["content"]
+
+
+def test_fewer_blocking_attacks_break_a_score_tie(monkeypatch):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "1")
+    bb = Blackboard("q", "s", iterations_completed=3,
+                    hypotheses=[_hyp("H1"), _hyp("H2")],
+                    critic_reviews=[_scored("H1", 4, 4, 4, 4, ["[READOUT] no such column", "[REASONING] x"]),
+                                    _scored("H2", 4, 4, 4, 4, ["[REASONING] y", "[REASONING] z"])])
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H2"]
+
+
+def test_list_order_breaks_a_full_tie(monkeypatch):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "2")
+    bb = Blackboard("q", "s", iterations_completed=3,
+                    hypotheses=[_hyp("H2"), _hyp("H3"), _hyp("H5")],
+                    critic_reviews=[_accept("H2"), _accept("H3"), _accept("H5")])
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H2", "H3"]
+
+
+def test_named_ids_override_the_ranking(monkeypatch):
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_IDS", "H1")
+    bb = Blackboard("q", "s", iterations_completed=3,
+                    hypotheses=[_hyp("H1"), _hyp("H2")],
+                    critic_reviews=[_scored("H1", 1, 1, 1, 1), _scored("H2", 5, 5, 5, 5)])
+    assert [h.id for h in pipeline._hypotheses_to_analyze(bb)] == ["H1"]
+
+
+def _ranked_board():
+    """H2 ranks first, then H1, then H3."""
+    return Blackboard("q", "s", iterations_completed=3,
+                      hypotheses=[_hyp("H1"), _hyp("H2"), _hyp("H3")],
+                      critic_reviews=[_scored("H1", 4, 4, 3, 4), _scored("H2", 4, 4, 4, 4),
+                                      _scored("H3", 3, 3, 3, 3)])
+
+
+def _run_with(monkeypatch, tmp_path, bb, untestable=()):
+    """Run Analyze with an analyst that reports each ID in `untestable` as not
+    testable and a critic that passes everything else. Returns the IDs tried."""
+    tried = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+        tried.append(hyp.id)
+        folder = workdir / "hypotheses" / hyp.id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "analysis.ipynb").write_text("{}")
+        if hyp.id in untestable:
+            raise pipeline.agentic_analyst.NotTestable("no such measurement")
+
+    def critic(bb, client, hyp, **kwargs):
+        hyp.methods_critique = {"verdict": "sound", "issues": []}
+    monkeypatch.setattr(pipeline.agentic_analyst, "run", analyst)
+    monkeypatch.setattr(pipeline.methods_critic, "run", critic)
+    client = type("Client", (), {"resolve_model": lambda self, role: "model"})()
+    asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    return tried
+
+
+def test_a_failed_hypothesis_falls_back_to_the_next_ranked(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "1")
+    bb = _ranked_board()
+    assert _run_with(monkeypatch, tmp_path, bb, untestable={"H2"}) == ["H2", "H1"]
+    assert any(e["action"] == "fallback" and e["content"].startswith("H1") for e in bb.notebook)
+    assert "then H1 if one fails" in next(e["content"] for e in bb.notebook if e["action"] == "selection")
+
+
+def test_no_fallback_runs_once_enough_have_passed(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "1")
+    bb = _ranked_board()
+    assert _run_with(monkeypatch, tmp_path, bb) == ["H2"]
+    assert not any(e["action"] == "fallback" for e in bb.notebook)
+
+
+def test_max_attempts_caps_the_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "1")
+    monkeypatch.setenv("VP_ANALYZE_MAX_ATTEMPTS", "1")
+    with pytest.raises(pipeline.NotTestableStage, match="H2"):
+        _run_with(monkeypatch, tmp_path, _ranked_board(), untestable={"H2"})
+
+
+def test_max_attempts_below_top_n_is_refused(monkeypatch):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "2")
+    monkeypatch.setenv("VP_ANALYZE_MAX_ATTEMPTS", "1")
+    with pytest.raises(ValueError, match="at least VP_ANALYZE_TOP_N"):
+        pipeline._hypotheses_to_analyze(_ranked_board())
+
+
+def test_named_ids_get_no_fallback(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_IDS", "H3")
+    with pytest.raises(pipeline.NotTestableStage, match="H3"):
+        _run_with(monkeypatch, tmp_path, _ranked_board(), untestable={"H3"})
+
+
+def _refusing_run(monkeypatch, tmp_path, bb, refusing_models):
+    """Run Analyze with an analyst that refuses on `refusing_models`. Returns
+    (hypothesis ID, model) for each analyst call."""
+    calls = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None):
+        calls.append((hyp.id, model_id))
+        if model_id in refusing_models:
+            raise pipeline.agentic_analyst.AnalystRefused(model_id)
+        folder = workdir / "hypotheses" / hyp.id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "analysis.ipynb").write_text("{}")
+        hyp.analysis_workdir, hyp.analysis_summary = f"hypotheses/{hyp.id}", "done"
+
+    def critic(bb, client, hyp, **kwargs):
+        hyp.methods_critique = {"verdict": "sound", "issues": []}
+    monkeypatch.setattr(pipeline.agentic_analyst, "run", analyst)
+    monkeypatch.setattr(pipeline.methods_critic, "run", critic)
+    client = type("Client", (), {"resolve_model": lambda self, role: "opus-5-5", "usage_log": []})()
+    asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+    return calls, client.usage_log
+
+
+def test_a_refused_round_reruns_on_the_fallback_and_stays_there(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "2")
+    monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "opus-4-7")
+    calls, usage = _refusing_run(monkeypatch, tmp_path, _ranked_board(), {"opus-5-5"})
+    assert calls == [("H2", "opus-5-5"), ("H2", "opus-4-7"), ("H1", "opus-4-7")]
+    assert usage == [{"event": "refusal", "agent": "agentic_analyst", "hypothesis_id": "H2",
+                      "model_id": "opus-5-5", "fallback_model_id": "opus-4-7"}]
+
+
+def test_when_every_model_refuses_the_next_hypothesis_is_tried(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_TOP_N", "1")
+    monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "none")
+    with pytest.raises(pipeline.AllAnalystsRefused, match="H2: every analyst model refused"):
+        _refusing_run(monkeypatch, tmp_path, _ranked_board(), {"opus-5-5"})

@@ -184,3 +184,41 @@ def test_without_a_server_the_analyst_gets_no_mcp_tools(monkeypatch, tmp_path):
     assert seen["options"].mcp_servers == {}
     deny = asyncio.run(seen["options"].can_use_tool("mcp__pennsieve__list_discover_files", {}, None))
     assert type(deny).__name__ == "PermissionResultDeny"
+
+
+@pytest.mark.parametrize("where", ["assistant", "result"])
+def test_a_refusal_in_the_session_raises_analyst_refused(monkeypatch, tmp_path, where):
+    seen = {}
+
+    class Client:
+        def __init__(self, options):
+            seen["fallback"] = options.fallback_model
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            pass
+        async def receive_response(self):
+            if where == "assistant":
+                yield SimpleNamespace(model="m", content=[], stop_reason="refusal")
+            yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.2, result="",
+                                  usage={}, stop_reason="refusal" if where == "result" else "end_turn")
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    monkeypatch.delenv("VP_ANALYZE_FALLBACK_MODEL", raising=False)
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    with pytest.raises(agentic_analyst.AnalystRefused, match="us.anthropic.claude-opus-5-5"):
+        asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="us.anthropic.claude-opus-5-5"))
+    assert h.analysis_cost_usd == 0.2
+    # Claude Code's own fallback is set too, for an overloaded or unavailable model.
+    assert seen["fallback"] == agentic_analyst.DEFAULT_ANALYST_FALLBACK
+
+
+def test_the_fallback_list_skips_the_model_already_in_use(monkeypatch):
+    monkeypatch.delenv("VP_ANALYZE_FALLBACK_MODEL", raising=False)
+    assert agentic_analyst.analyst_fallbacks(agentic_analyst.DEFAULT_ANALYST_FALLBACK) == []
+    monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "a, b")
+    assert agentic_analyst.analyst_fallbacks("a") == ["b"]
+    monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "none")
+    assert agentic_analyst.analyst_fallbacks("x") == []

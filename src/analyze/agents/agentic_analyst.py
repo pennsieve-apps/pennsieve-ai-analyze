@@ -51,6 +51,24 @@ MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
 MCP_SERVER = "pennsieve"
 MCP_TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
 
+# The analyst's model when its first model refuses the task. Opus 4.7 has not
+# refused any of the pipeline's datasets; Opus 5.5 refused seed 405.
+DEFAULT_ANALYST_FALLBACK = "us.anthropic.claude-opus-4-7"
+
+
+def analyst_fallbacks(model_id: str) -> list[str]:
+    """Models to try, in order, after `model_id` refuses the task.
+
+    `VP_ANALYZE_FALLBACK_MODEL` is a comma-separated list that replaces the
+    default; `none` turns the fallback off.
+    """
+    configured = os.environ.get("VP_ANALYZE_FALLBACK_MODEL", "").strip()
+    if configured.lower() in ("none", "off"):
+        return []
+    models = [m.strip() for m in configured.split(",") if m.strip()] or [DEFAULT_ANALYST_FALLBACK]
+    return [m for m in models if m != model_id]
+
+
 # Tool results are cut to this many characters in the trace, unless
 # VP_LOG_LLM_IO=1 asks for the full transcript.
 TRACE_RESULT_CHARS = 8000
@@ -71,6 +89,8 @@ async def run(
     direct backend; the governor path leaves that to the platform.
     `usage_log` is the stage's usage list (`LLMClient.usage_log`); the
     session's token counts are added to it as one `agent_sdk_result` row.
+    `analyst_fallbacks` also go to Claude Code's own fallback, which covers a
+    model that is overloaded or unavailable. A refusal raises `AnalystRefused`.
     """
     try:
         from claude_agent_sdk import (
@@ -124,6 +144,7 @@ async def run(
         can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
         env=claude_code_env(background_model),
+        fallback_model=",".join(analyst_fallbacks(model_id)) or None,
     )
 
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -131,6 +152,7 @@ async def run(
     total_cost = 0.0
     final_text = ""
     completed = False
+    refused = False
     trace_path = hyp_workdir / "agent-events.jsonl"
 
     def event(kind, **fields):
@@ -182,6 +204,9 @@ async def run(
                             final_text = block.text
                             if raw:
                                 event("text", text=block.text)
+                if getattr(msg, "stop_reason", None) == "refusal" and not refused:
+                    refused = True
+                    event("refusal", model=getattr(msg, "model", None) or model_id)
                 usage = getattr(msg, "usage", None)
                 if raw and usage and not hasattr(msg, "is_error"):
                     event("turn_usage", model=getattr(msg, "model", None), usage=usage)
@@ -195,10 +220,14 @@ async def run(
                     _record_sdk_usage(usage_log, hypothesis.id, model_id,
                                       getattr(msg, "usage", None) or {}, total_cost,
                                       len(tools_called), getattr(msg, "num_turns", None))
+                    if refused:
+                        raise AnalystRefused(model_id)
                     if msg.is_error or getattr(msg, "subtype", "") != "success":
                         raise RuntimeError(f"Agent did not complete: {getattr(msg, 'subtype', '?')}")
                     completed = True
                     final_text = getattr(msg, "result", None) or final_text
+        if refused:
+            raise AnalystRefused(model_id)
         if not completed or not final_text.strip():
             raise RuntimeError("Agent ended without a successful result and summary")
         validate_notebook(hyp_workdir / "analysis.ipynb")
@@ -209,6 +238,11 @@ async def run(
         hypothesis.analysis_workdir = str(hyp_workdir.relative_to(workdir.resolve().parent))
         hypothesis.analysis_summary = final_text[:8000]
         bb.log("agentic_analyst", "not_testable", f"hypothesis {hypothesis.id}: {e}")
+        raise
+    except AnalystRefused as e:
+        hypothesis.analysis_cost_usd += total_cost
+        hypothesis.analysis_tools_called.extend(tools_called)
+        bb.log("agentic_analyst", "refused", f"hypothesis {hypothesis.id}: {e}")
         raise
     except Exception as e:
         hypothesis.analysis_cost_usd += total_cost
@@ -376,6 +410,15 @@ STATUS_FILE = "analysis_status.json"
 class NotTestable(RuntimeError):
     """The deposit cannot test the hypothesis as stated. An honest outcome,
     recorded on the hypothesis; it is not an analysis failure."""
+
+
+class AnalystRefused(RuntimeError):
+    """The session's model refused the task (stop_reason "refusal"). The
+    pipeline reruns the round on a fallback model (`VP_ANALYZE_FALLBACK_MODEL`)."""
+
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        super().__init__(f"{model_id} refused the analysis task")
 
 PENNSIEVE_TOOLS_SECTION = """## Pennsieve tools
 
