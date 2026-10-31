@@ -158,6 +158,13 @@ async def run(
     final_text = ""
     completed = False
     refused = False
+    # The SDK reports the session's usage only on its result message, so a
+    # session that is cancelled or crashes spends real money and leaves no
+    # usage row. Keep a running total from the per-turn usage instead, and
+    # record it if the result never arrives.
+    turn_totals = dict.fromkeys(USAGE_KEYS, 0)
+    turns_seen = 0
+    usage_recorded = False
     trace_path = hyp_workdir / "agent-events.jsonl"
 
     def event(kind, **fields):
@@ -213,8 +220,12 @@ async def run(
                     refused = True
                     event("refusal", model=getattr(msg, "model", None) or model_id)
                 usage = getattr(msg, "usage", None)
-                if raw and usage and not hasattr(msg, "is_error"):
-                    event("turn_usage", model=getattr(msg, "model", None), usage=usage)
+                if usage and not hasattr(msg, "is_error"):
+                    turns_seen += 1
+                    for key in USAGE_KEYS:
+                        turn_totals[key] += _count(usage, key)
+                    if raw:
+                        event("turn_usage", model=getattr(msg, "model", None), usage=usage)
                 cost = getattr(msg, "total_cost_usd", None)
                 if cost is not None:
                     total_cost = max(total_cost, float(cost))
@@ -225,6 +236,7 @@ async def run(
                     _record_sdk_usage(usage_log, hypothesis.id, model_id,
                                       getattr(msg, "usage", None) or {}, total_cost,
                                       len(tools_called), getattr(msg, "num_turns", None))
+                    usage_recorded = True
                     if refused:
                         raise AnalystRefused(model_id)
                     if msg.is_error or getattr(msg, "subtype", "") != "success":
@@ -259,6 +271,13 @@ async def run(
         raise RuntimeError(
             f"Agentic analysis failed for hypothesis {hypothesis.id}"
         ) from e
+    finally:
+        # Whatever ended the session — a cancelled timeout, a crash, a refusal —
+        # the turns it took were billed. Record them so the run's cost is the
+        # cost of the run.
+        if not usage_recorded:
+            _record_sdk_usage(usage_log, hypothesis.id, model_id, turn_totals, total_cost,
+                              len(tools_called), turns_seen, partial=True)
 
     # Record artifacts on the hypothesis. The Write stage reads these to
     # produce the final report.
@@ -276,10 +295,22 @@ async def run(
     )
 
 
-def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, tools, turns) -> None:
+USAGE_KEYS = ("input_tokens", "output_tokens",
+              "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _count(usage, key: str) -> int:
+    value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, 0)
+    return int(value or 0)
+
+
+def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, tools, turns,
+                      *, partial: bool = False) -> None:
     """Add the analyst session's token counts to the stage usage log.
 
-    The Agent SDK reports the session's total usage on its result message.
+    The Agent SDK reports the session's total usage on its result message. A
+    session that never reaches one still spent its turns, so `partial` marks a
+    row summed from the per-turn usage instead.
     Only token counts are stored, under the same field names as the other
     usage rows, so cost can be worked out later from a price table. The SDK's
     own `total_cost_usd` comes from Claude Code's built-in Anthropic list
@@ -290,8 +321,7 @@ def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, t
         return
 
     def count(key):
-        value = sdk_usage.get(key) if isinstance(sdk_usage, dict) else getattr(sdk_usage, key, 0)
-        return int(value or 0)
+        return _count(sdk_usage, key)
 
     usage_log.append({
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -307,6 +337,9 @@ def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, t
         "tools_called": tools,
         "turns": turns,
         "sdk_reported_cost_usd": float(sdk_cost),
+        # Summed from the turns rather than read off a result message that
+        # never came, so the session's tokens still reach the cost total.
+        **({"partial": True} if partial else {}),
     })
 
 

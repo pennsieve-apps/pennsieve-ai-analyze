@@ -224,3 +224,64 @@ def test_the_fallback_list_skips_the_model_already_in_use(monkeypatch):
     assert agentic_analyst.analyst_fallbacks("a") == ["b"]
     monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "none")
     assert agentic_analyst.analyst_fallbacks("x") == []
+
+
+def test_a_cancelled_session_still_records_what_it_spent(monkeypatch, tmp_path):
+    """The SDK reports usage only on its result message. A session killed by
+    the hypothesis timeout spent real money; without this it reaches no usage
+    log and the run's cost is understated. Seed 405's H1 cost $0.60 that way.
+    """
+    class Client:
+        def __init__(self, options):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            pass
+        async def receive_response(self):
+            for _ in range(3):
+                yield SimpleNamespace(content=[], usage={"input_tokens": 10, "output_tokens": 5,
+                                                         "cache_read_input_tokens": 900,
+                                                         "cache_creation_input_tokens": 100})
+            raise asyncio.CancelledError
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    usage_log = []
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="test",
+                                        usage_log=usage_log))
+
+    assert len(usage_log) == 1
+    row = usage_log[0]
+    assert row["partial"] is True and row["turns"] == 3
+    assert row["input_tokens"] == 30 and row["output_tokens"] == 15
+    assert row["cache_read_input_tokens"] == 2700
+    # The cost roll-up counts it like any other analyst row.
+    from pennsieve_ai_utils import pricing
+    assert pricing.summarize_usage(usage_log)["requests"] == 1
+
+
+def test_a_completed_session_records_one_row_only(monkeypatch, tmp_path):
+    class Client:
+        def __init__(self, options):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            return False
+        async def query(self, prompt):
+            write_outputs(tmp_path / "hypotheses/H1")
+        async def receive_response(self):
+            yield SimpleNamespace(content=[], usage={"input_tokens": 10, "output_tokens": 5})
+            yield SimpleNamespace(subtype="success", is_error=False, total_cost_usd=0.1,
+                                  result="summary", usage={"input_tokens": 10, "output_tokens": 5})
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", Client)
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "prediction", "experiment")
+    usage_log = []
+    asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="test", usage_log=usage_log))
+    assert len(usage_log) == 1 and "partial" not in usage_log[0]
