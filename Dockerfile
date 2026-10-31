@@ -34,6 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# The Claude Agent SDK wheel is ~107 MB, which pip's 15-second socket read
+# timeout cannot pull over a slow link: the download aborts, pip backtracks
+# through every jsonschema release and reports a resolution conflict that is
+# really a network timeout. Give the download room and retry it.
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5
+
 # Source must be in place before `pip install .` because pyproject.toml's
 # [tool.setuptools.packages.find] points at src/ and the build fails without it.
 COPY pyproject.toml ./
