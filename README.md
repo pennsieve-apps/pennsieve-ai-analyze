@@ -54,6 +54,22 @@ hypothesis as **unresolved** and exits 8. Both write the reason to
 `not_testable.json` or `unresolved.json` in the hypothesis folder, keep the
 notebooks, and do not count as a pass, so Write builds no manuscript on them.
 
+**Budgets bound a hypothesis, not the stage.** A wall-clock cap on the whole
+stage fires in the middle of a hypothesis and takes the finished ones down with
+it, leaving a run nobody can interpret. Instead each hypothesis has its own
+time budget (`VP_ANALYZE_HYPOTHESIS_TIMEOUT_S`): past it the hypothesis is
+recorded as **timed out** and the next one starts. A run cost ceiling
+(`VP_RUN_COST_LIMIT_USD`) stops the stage between hypotheses, where everything
+finished is already on disk, and exits 9.
+
+**Every hypothesis is checkpointed.** The moment one settles — passed, not
+testable, unresolved, timed out or refused — its outcome and the fields Write
+reads are written to `hypotheses/<id>/outcome.json`. Running the stage again
+skips what is already settled, so a retry pays only for the undecided ones.
+An attempt that died mid-analysis leaves no outcome, so its folder is moved to
+`<id>.attempt<n>` and the hypothesis is analyzed again on a clean directory.
+To retry one that did settle, delete its folder.
+
 **Refusals.** If the analyst's model refuses the task, Analyze reruns that
 round on `VP_ANALYZE_FALLBACK_MODEL` (Opus 4.7 by default) and keeps that model
 for the rest of the stage. It logs `analyze: refusal_fallback`. If every model
@@ -141,6 +157,9 @@ python -m analyze.main
 | `VP_ANALYZE_HYPOTHESIS_IDS` | unset | A comma-separated list of hypothesis IDs to analyze, in order, instead of taking the best-ranked `VP_ANALYZE_TOP_N`. It overrides the ranking, and there is no fallback. Each ID must be accepted at the final iteration. Use it to reach a specific accepted hypothesis when the top-ranked one is not testable. |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
 | `VP_ANALYZE_MAX_METHODS_ITERS` | `3` | Maximum analyst/critic passes before an unresolved methods review fails the stage |
+| `VP_ANALYZE_HYPOTHESIS_TIMEOUT_S` | `5400` | How long one hypothesis may take, across all its rounds. Past it the hypothesis is recorded as `timed_out` and the next one starts, so a stuck analyst costs one hypothesis rather than the stage. `off` removes the cap. |
+| `VP_RUN_COST_LIMIT_USD` | unset | A ceiling on what the whole run may cost, counting the earlier stages. It is checked between hypotheses, where everything finished is already on disk, and the stage exits 9. Raise it and run the stage again to continue. |
+| `VP_ANALYZE_RESUME` | `1` | Skip hypotheses whose outcome is already recorded in `hypotheses/<id>/outcome.json`, so a retry pays only for the undecided ones. Set to `0` to analyze everything again. To retry one hypothesis, delete its folder. |
 | `VP_ANALYZE_STAGE_FILES` | `12` | How many of the seed dataset's data files to download before the analyst starts |
 | `VP_ANALYZE_STAGE_MAX_MB` | `200` | Total size budget, in MiB, for that pre-download |
 | `VP_ANALYZE_STAGE_DATA` | unset | Set to `0` to write only the file index and download nothing |

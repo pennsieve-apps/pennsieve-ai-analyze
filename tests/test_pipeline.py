@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import pytest
 
 from analyze import pipeline
@@ -417,3 +418,182 @@ def test_when_every_model_refuses_the_next_hypothesis_is_tried(monkeypatch, tmp_
     monkeypatch.setenv("VP_ANALYZE_FALLBACK_MODEL", "none")
     with pytest.raises(pipeline.AllAnalystsRefused, match="H2: every analyst model refused"):
         _refusing_run(monkeypatch, tmp_path, _ranked_board(), {"opus-5-5"})
+
+
+# --- budgets: a hypothesis, not the stage, is what a cap bounds -------------
+#
+# A wall-clock cap on the whole stage fires in the middle of a hypothesis and
+# takes the finished ones down with it, leaving a run nobody can interpret.
+# These cover the three budgets that replaced it.
+
+
+def _budgeted_run(monkeypatch, tmp_path, bb, *, analyst, spent_before=0.0, usage_log=None):
+    """Run Analyze with a given analyst and a critic that passes everything."""
+    def critic(bb, client, hyp, **kwargs):
+        hyp.methods_critique = {"verdict": "sound", "issues": []}
+    monkeypatch.setattr(pipeline.agentic_analyst, "run", analyst)
+    monkeypatch.setattr(pipeline.methods_critic, "run", critic)
+    client = type("Client", (), {"resolve_model": lambda self, role: "model",
+                                 "usage_log": usage_log if usage_log is not None else []})()
+    return asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path,
+                                            spent_before=spent_before))
+
+
+def test_a_slow_hypothesis_is_timed_out_and_the_next_one_still_runs(monkeypatch, tmp_path):
+    """The cap costs one hypothesis, not the stage: H2 hangs, H1 still passes."""
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_TIMEOUT_S", "0.05")
+    tried = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+        tried.append(hyp.id)
+        folder = workdir / "hypotheses" / hyp.id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "analysis.ipynb").write_text("{}")
+        if hyp.id == "H2":
+            await asyncio.sleep(30)
+
+    bb = _ranked_board()
+    _budgeted_run(monkeypatch, tmp_path, bb, analyst=analyst)
+
+    assert tried == ["H2", "H1", "H3"], "the stage carries on past the one that hung"
+    recorded = json.loads((tmp_path / "hypotheses/H2/outcome.json").read_text())
+    assert recorded["outcome"] == "timed_out" and "0.05s budget" in recorded["reason"]
+    assert json.loads((tmp_path / "hypotheses/H1/outcome.json").read_text())["outcome"] == "passed"
+
+
+def test_the_budget_is_checked_between_rounds_too(monkeypatch, tmp_path):
+    """The methods critic is synchronous, so it is not bounded by the analyst's
+    timeout; a hypothesis that runs over during review still stops."""
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_TIMEOUT_S", "0.2")
+    monkeypatch.setenv("VP_ANALYZE_MAX_METHODS_ITERS", "3")
+    rounds = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+        rounds.append(hyp.id)
+        folder = workdir / "hypotheses" / hyp.id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "analysis.ipynb").write_text("{}")
+
+    def slow_critic(bb, client, hyp, **kwargs):
+        time.sleep(0.25)
+        hyp.methods_critique = {"verdict": "concerns",
+                                "issues": [{"severity": "high", "kind": "fixable", "description": "x"}]}
+
+    monkeypatch.setattr(pipeline.agentic_analyst, "run", analyst)
+    monkeypatch.setattr(pipeline.methods_critic, "run", slow_critic)
+    client = type("Client", (), {"resolve_model": lambda self, role: "model"})()
+    bb = Blackboard("q", "s", iterations_completed=3, hypotheses=[_hyp("H1")],
+                    critic_reviews=[_accept("H1")])
+
+    with pytest.raises(pipeline.ReviewUnresolved):
+        asyncio.run(pipeline.run_analyze(bb, client, workdir=tmp_path))
+
+    assert len(rounds) == 1, "the second round never starts"
+    assert json.loads((tmp_path / "hypotheses/H1/outcome.json").read_text())["outcome"] == "timed_out"
+
+
+def test_a_settled_hypothesis_is_not_analyzed_again(monkeypatch, tmp_path):
+    """The expensive half of a retry: a rerun pays only for what is undecided."""
+    first = []
+    second = []
+
+    def analyst_recording(into):
+        async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+            into.append(hyp.id)
+            folder = workdir / "hypotheses" / hyp.id
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "analysis.ipynb").write_text("{}")
+            hyp.analysis_workdir = f"hypotheses/{hyp.id}"
+            hyp.analysis_summary = "ran"
+            hyp.analysis_tools_called = ["Bash"]
+        return analyst
+
+    _budgeted_run(monkeypatch, tmp_path, _ranked_board(), analyst=analyst_recording(first))
+    assert first == ["H2", "H1", "H3"]
+
+    bb = _ranked_board()  # a rerun starts from Hypothesize's blackboard again
+    _budgeted_run(monkeypatch, tmp_path, bb, analyst=analyst_recording(second))
+
+    assert second == [], "every hypothesis was already settled"
+    # Write reads these off the blackboard, so a resume has to put them back.
+    assert [h.analysis_summary for h in bb.hypotheses] == ["ran", "ran", "ran"]
+    assert bb.hypotheses[0].analysis_tools_called == ["Bash"]
+    assert any(e["action"] == "resumed" for e in bb.notebook)
+
+
+def test_a_half_finished_hypothesis_is_rerun_with_its_files_kept(monkeypatch, tmp_path):
+    """No outcome recorded means the attempt died mid-analysis. Its files are
+    evidence, but the analyst gets a clean directory."""
+    folder = tmp_path / "hypotheses" / "H2"
+    folder.mkdir(parents=True)
+    (folder / "analysis.ipynb").write_text("half-written")
+    tried = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+        tried.append(hyp.id)
+        f = workdir / "hypotheses" / hyp.id
+        f.mkdir(parents=True, exist_ok=True)
+        (f / "analysis.ipynb").write_text("{}")
+
+    bb = _ranked_board()
+    _budgeted_run(monkeypatch, tmp_path, bb, analyst=analyst)
+
+    assert "H2" in tried
+    assert (tmp_path / "hypotheses/H2.attempt1/analysis.ipynb").read_text() == "half-written"
+    assert (tmp_path / "hypotheses/H2/analysis.ipynb").read_text() == "{}"
+
+
+def test_resume_can_be_turned_off(monkeypatch, tmp_path):
+    monkeypatch.setenv("VP_ANALYZE_RESUME", "0")
+    done = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+        done.append(hyp.id)
+        f = workdir / "hypotheses" / hyp.id
+        f.mkdir(parents=True, exist_ok=True)
+        (f / "analysis.ipynb").write_text("{}")
+
+    _budgeted_run(monkeypatch, tmp_path, _ranked_board(), analyst=analyst)
+    _budgeted_run(monkeypatch, tmp_path, _ranked_board(), analyst=analyst)
+    assert done == ["H2", "H1", "H3", "H2", "H1", "H3"]
+
+
+def test_the_cost_ceiling_stops_between_hypotheses(monkeypatch, tmp_path):
+    """Stopping between hypotheses leaves every finished one interpretable."""
+    monkeypatch.setenv("VP_RUN_COST_LIMIT_USD", "10")
+    log = []
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+        f = workdir / "hypotheses" / hyp.id
+        f.mkdir(parents=True, exist_ok=True)
+        (f / "analysis.ipynb").write_text("{}")
+        log.append({"event": "request_complete", "model_id": "m", "cost_usd": 6.0})
+
+    with pytest.raises(pipeline.CostLimitReached, match=r"\$12.00 of the \$10.00 ceiling") as caught:
+        _budgeted_run(monkeypatch, tmp_path, _ranked_board(), analyst=analyst, usage_log=log)
+
+    assert caught.value.stopped_at == "H3" and caught.value.analyzed == 2
+    # The two that ran are complete on disk, not truncated.
+    for hid in ("H2", "H1"):
+        assert json.loads((tmp_path / f"hypotheses/{hid}/outcome.json").read_text())["outcome"] == "passed"
+    assert not (tmp_path / "hypotheses/H3").exists()
+
+
+def test_the_ceiling_counts_what_the_earlier_stages_spent(monkeypatch, tmp_path):
+    """It is a run ceiling, not a stage one: Hypothesize is most of the bill."""
+    monkeypatch.setenv("VP_RUN_COST_LIMIT_USD", "10")
+
+    async def analyst(bb, hyp, *, workdir, model_id, background_model="", usage_log=None, can_invoke=None):
+        raise AssertionError("no hypothesis should start")
+
+    with pytest.raises(pipeline.CostLimitReached, match=r"\$12.00"):
+        _budgeted_run(monkeypatch, tmp_path, _ranked_board(), analyst=analyst, spent_before=12.0)
+
+
+def test_no_ceiling_and_no_timeout_by_configuration(monkeypatch):
+    monkeypatch.delenv("VP_RUN_COST_LIMIT_USD", raising=False)
+    assert pipeline._cost_limit() is None
+    monkeypatch.setenv("VP_ANALYZE_HYPOTHESIS_TIMEOUT_S", "off")
+    assert pipeline._hypothesis_timeout() is None
+    monkeypatch.delenv("VP_ANALYZE_HYPOTHESIS_TIMEOUT_S", raising=False)
+    assert pipeline._hypothesis_timeout() == pipeline.DEFAULT_HYPOTHESIS_TIMEOUT_S

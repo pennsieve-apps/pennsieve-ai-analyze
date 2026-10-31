@@ -7,15 +7,30 @@ weak inferences). Results are recorded back onto the hypothesis.
 
 Analyze up to N accepted hypotheses (default 1), with a bounded methods
 revision loop. Rejected or unreviewed candidates cannot enter analysis.
+
+Every hypothesis ends on a recorded outcome, written to
+`hypotheses/<id>/outcome.json` as soon as it is reached. Three budgets bound
+the stage without truncating it mid-hypothesis:
+
+* `VP_ANALYZE_HYPOTHESIS_TIMEOUT_S` caps one hypothesis, not the stage. Past
+  it the hypothesis is recorded as `timed_out` and the next one starts, so a
+  stuck analyst costs one hypothesis instead of the whole run.
+* `VP_RUN_COST_LIMIT_USD` stops the stage between hypotheses, at a point
+  where everything finished so far is on disk and interpretable.
+* `VP_ANALYZE_RESUME` (on by default) skips hypotheses whose outcome is
+  already recorded, so a retry pays only for what has not been decided.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 
 from analyze.agents import agentic_analyst, methods_critic
+from pennsieve_ai_utils import pricing
 from pennsieve_ai_utils.blackboard import Blackboard
 from pennsieve_ai_utils.llm import LLMClient
 
@@ -23,6 +38,103 @@ from pennsieve_ai_utils.llm import LLMClient
 # Critic attack tags saying the lab or the deposit cannot support the test as
 # described. Fewer of them breaks ties between equally scored hypotheses.
 BLOCKING_ATTACK_TAGS = ("[CONSTRAINT]", "[READOUT]")
+
+# Outcomes that settle a hypothesis. A resumed run does not pay for these
+# again: each is a result to report, including `timed_out`, which says the
+# analysis did not finish inside its budget. To try one again, delete its
+# folder under `hypotheses/`.
+CONCLUSIVE = ("passed", "not_testable", "unresolved", "timed_out", "refused")
+
+# What a resumed run has to put back on the hypothesis for Write to read.
+ANALYSIS_FIELDS = ("analysis_workdir", "analysis_summary", "analysis_cost_usd",
+                   "analysis_tools_called", "analysis_started_at",
+                   "analysis_finished_at", "methods_critique")
+
+DEFAULT_HYPOTHESIS_TIMEOUT_S = 5400
+
+
+def _hypothesis_timeout() -> float | None:
+    """Seconds one hypothesis may take, or None for no cap.
+
+    This is deliberately per hypothesis rather than per stage: a wall-clock cap
+    on the stage fires in the middle of a hypothesis and throws away the
+    finished ones alongside it, leaving a run nobody can interpret.
+    """
+    raw = os.environ.get("VP_ANALYZE_HYPOTHESIS_TIMEOUT_S", "").strip().lower()
+    if raw in ("none", "off", "0"):
+        return None
+    if not raw:
+        return float(DEFAULT_HYPOTHESIS_TIMEOUT_S)
+    seconds = float(raw)
+    if seconds < 0:
+        raise ValueError("VP_ANALYZE_HYPOTHESIS_TIMEOUT_S must be positive, or 'off'")
+    return seconds
+
+
+def _cost_limit() -> float | None:
+    """Dollars the run may spend in total, or None for no ceiling."""
+    raw = os.environ.get("VP_RUN_COST_LIMIT_USD", "").strip()
+    if not raw:
+        return None
+    limit = float(raw)
+    if limit <= 0:
+        raise ValueError("VP_RUN_COST_LIMIT_USD must be positive")
+    return limit
+
+
+def _spent(client, before: float) -> float:
+    """What the run has cost: the stages before this one, plus this one so far."""
+    rows = getattr(client, "usage_log", None) or []
+    return round(before + pricing.summarize_usage(rows)["cost_usd"], 4)
+
+
+def _checkpoint(hyp, folder: Path, outcome: str, reason: str) -> None:
+    """Record a settled hypothesis so a retry does not pay for it again."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "outcome.json").write_text(json.dumps(
+        {"hypothesis_id": hyp.id, "outcome": outcome, "reason": reason,
+         "analysis": {name: getattr(hyp, name) for name in ANALYSIS_FIELDS}}, indent=2))
+
+
+def _resume(bb: Blackboard, hyp, folder: Path) -> tuple[str, str] | None:
+    """Reload a settled hypothesis, or clear a half-finished folder.
+
+    Returns the recorded outcome when there is one. Otherwise an earlier
+    attempt died mid-analysis: its folder moves aside, both to keep the
+    evidence and to hand the analyst a clean directory.
+    """
+    if os.environ.get("VP_ANALYZE_RESUME", "1").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    record = {}
+    path = folder / "outcome.json"
+    if path.exists():
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            record = {}
+    outcome = record.get("outcome")
+    if outcome not in CONCLUSIVE:
+        if folder.exists():
+            aside = _free_name(folder)
+            folder.rename(aside)
+            bb.log("analyze", "retry",
+                   f"{hyp.id}: an earlier attempt left no outcome; "
+                   f"its files are in {aside.name} and the hypothesis is analyzed again")
+        return None
+    for name, value in (record.get("analysis") or {}).items():
+        if name in ANALYSIS_FIELDS:
+            setattr(hyp, name, value)
+    reason = record.get("reason", "")
+    bb.log("analyze", "resumed", f"{hyp.id}: {outcome} on an earlier attempt; not analyzed again")
+    return outcome, reason
+
+
+def _free_name(folder: Path) -> Path:
+    for n in range(1, 100):
+        candidate = folder.with_name(f"{folder.name}.attempt{n}")
+        if not candidate.exists():
+            return candidate
+    raise ValueError(f"too many earlier attempts at {folder}")
 
 
 def _rank_key(review, position: int) -> tuple:
@@ -108,9 +220,14 @@ def _analysis_queue(bb: Blackboard) -> tuple[list, int]:
     return queue, n
 
 
-async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> None:
+async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path,
+                      spent_before: float = 0.0) -> None:
     """Top-level analyze pipeline. Async because the agentic analyst uses
-    the Claude Agent SDK, which is async."""
+    the Claude Agent SDK, which is async.
+
+    `spent_before` is what the earlier stages of this run already cost, so the
+    ceiling in `VP_RUN_COST_LIMIT_USD` covers the run rather than this stage.
+    """
     targets, wanted = _analysis_queue(bb)
     if not targets:
         message = ("No accepted hypotheses in the final iteration. Review the "
@@ -121,6 +238,8 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
     max_iters = int(os.environ.get("VP_ANALYZE_MAX_METHODS_ITERS", "3"))
     if max_iters < 1:
         raise ValueError("VP_ANALYZE_MAX_METHODS_ITERS must be at least 1")
+    per_hypothesis = _hypothesis_timeout()
+    limit = _cost_limit()
 
     print(f"\n--- agentic analyst (aiming to pass {wanted}, trying up to "
           f"{len(targets)} hypothesis/es) ---")
@@ -133,22 +252,53 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
     not_testable: dict[str, str] = {}
     unresolved: dict[str, str] = {}
     refused: dict[str, str] = {}
+    buckets = {"passed": passed, "not_testable": not_testable,
+               "unresolved": unresolved, "timed_out": unresolved, "refused": refused}
     for position, hyp in enumerate(targets):
         if len(passed) >= wanted:
             break
+        folder = workdir / "hypotheses" / hyp.id
+        settled = _resume(bb, hyp, folder)
+        if settled is not None:
+            outcome, reason = settled
+            bucket = buckets[outcome]
+            if outcome == "passed":
+                passed.append(hyp.id)
+            else:
+                bucket[hyp.id] = reason
+            continue
+        spent = _spent(client, spent_before)
+        if limit is not None and spent >= limit:
+            # Between hypotheses is the one place the stage can stop and still
+            # leave a record that reads as a result rather than a truncation.
+            raise CostLimitReached(spent, limit, analyzed=len(passed) + len(not_testable)
+                                   + len(unresolved) + len(refused), stopped_at=hyp.id)
         if position >= wanted:
             # A hypothesis before this one did not pass, so this one takes its place.
             bb.log("analyze", "fallback",
                    f"{hyp.id}: trying the next-ranked hypothesis "
                    f"({len(passed)} of {wanted} passed so far)")
+        deadline = None if per_hypothesis is None else time.monotonic() + per_hypothesis
         for iteration in range(1, max_iters + 1):
             bb.log("analyze", "iteration", f"{hyp.id}: {iteration}/{max_iters}")
-            folder = workdir / "hypotheses" / hyp.id
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                _record_outcome(bb, hyp, folder, "timed_out",
+                                f"the analysis ran past its {per_hypothesis:g}s budget "
+                                f"after {iteration - 1} of {max_iters} rounds", unresolved)
+                break
             try:
                 # Sticky: after a refusal the rest of the stage uses the fallback.
-                analyst_model = await _run_analyst(bb, hyp, client, workdir=workdir,
-                                                   model_id=analyst_model,
-                                                   background_model=background_model)
+                analyst_model = await asyncio.wait_for(
+                    _run_analyst(bb, hyp, client, workdir=workdir,
+                                 model_id=analyst_model,
+                                 background_model=background_model),
+                    remaining)
+            except asyncio.TimeoutError:
+                _record_outcome(bb, hyp, folder, "timed_out",
+                                f"the analyst ran past the {per_hypothesis:g}s budget for one "
+                                f"hypothesis, in round {iteration} of {max_iters}", unresolved)
+                break
             except agentic_analyst.NotTestable as exc:
                 _record_outcome(bb, hyp, folder, "not_testable",
                                 f"the analyst found: {exc}", not_testable)
@@ -164,6 +314,8 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
             high = [i for i in critique.get("issues", []) if i.get("severity") == "high"]
             if critique.get("verdict") == "sound" and not high:
                 passed.append(hyp.id)
+                _checkpoint(hyp, folder, "passed",
+                            f"the methods critic found the analysis sound in round {iteration}")
                 break
             limits = [i for i in high if i.get("kind") == "data_limit"]
             last_round = iteration == max_iters
@@ -194,6 +346,23 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path) -> No
         raise NotTestableStage(not_testable)
     if not passed and refused:
         raise AllAnalystsRefused("; ".join(f"{h}: {r}" for h, r in refused.items()))
+
+
+class CostLimitReached(RuntimeError):
+    """The run reached `VP_RUN_COST_LIMIT_USD`.
+
+    Raised between hypotheses, never inside one, so every hypothesis already
+    analyzed has its notebooks, its methods review and its recorded outcome on
+    disk. Raising the ceiling and running the stage again resumes from there.
+    """
+
+    def __init__(self, spent: float, limit: float, *, analyzed: int, stopped_at: str) -> None:
+        self.spent, self.limit = spent, limit
+        self.analyzed, self.stopped_at = analyzed, stopped_at
+        super().__init__(
+            f"the run has cost ${spent:.2f} of the ${limit:.2f} ceiling in "
+            f"VP_RUN_COST_LIMIT_USD; stopped before {stopped_at}, with {analyzed} "
+            f"hypothesis/es analyzed. Raise the ceiling and run analyze again to continue.")
 
 
 class AllAnalystsRefused(RuntimeError):
@@ -265,5 +434,6 @@ def _record_outcome(bb: Blackboard, hyp, folder: Path, outcome: str, reason: str
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{outcome}.json").write_text(
         json.dumps({"hypothesis_id": hyp.id, "outcome": outcome, "reason": reason}, indent=2))
+    _checkpoint(hyp, folder, outcome, reason)
     bb.log("analyze", outcome, f"{hyp.id}: {reason}")
     out[hyp.id] = reason
