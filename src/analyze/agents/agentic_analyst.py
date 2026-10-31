@@ -248,6 +248,7 @@ async def run(
         if not completed or not final_text.strip():
             raise RuntimeError("Agent ended without a successful result and summary")
         validate_notebook(hyp_workdir / "analysis.ipynb")
+        check_analysis_plan(hyp_workdir)
         check_analysis_status(hyp_workdir)
     except NotTestable as e:
         hypothesis.analysis_cost_usd += total_cost
@@ -377,6 +378,19 @@ root privileges; standard `pip install` will fail.
 **Claim to test:** {hypothesis.claim}
 
 **Rationale:** {hypothesis.rationale}
+
+**Predicted observation (pre-specified):** {hypothesis.predicted_observation}
+
+**Experiment to run (pre-specified):** {hypothesis.suggested_experiment}
+
+The predicted observation and the experiment above are the approved plan: a
+hypothesis critic accepted this hypothesis on the strength of that specific
+test. They are what you run. Troubleshooting is expected — fixing code,
+chasing down file layouts, correcting a gate, making a tool call work. Changing
+*what is tested* is not: do not drop an arm the claim names, do not swap the
+metric the prediction states, do not narrow the comparison, and do not exclude
+samples on the basis of the quantity you are testing. A test the deposit cannot
+support is reported as `not_testable`, never quietly replaced by one it can.
 {revision}
 
 {data_access}
@@ -395,19 +409,36 @@ root privileges; standard `pip install` will fail.
    available, call `describe_discover_folder` on each folder you plan to use.
    If the deposit cannot test the claim as stated, do not substitute a proxy:
    write a short notebook that documents the check, and report the status
-   `not_testable` (step 5).
+   `not_testable` (step 6).
    Then inspect the data itself. Look at actual columns, dtypes, NaN rates —
    do NOT assume schema from the title alone.
-2. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
-   end-to-end: load → preprocess → analysis → conclusion.
-3. Run it via papermill. Fix errors iteratively.
+2. Before computing any result, write `{PLAN_FILE}`, as JSON, setting down the
+   test you are about to run, taken from the pre-specified plan above:
+   `{{"primary_comparison": "<the one comparison that decides the claim>",
+     "arms": ["<every group or condition the claim names>"],
+     "metric": "<the quantity compared, as the prediction states it>",
+     "planned_exclusions": ["<any, with the control-or-QC reason>"],
+     "statistical_test": "<the test and what counts as the independent unit>",
+     "deviations": []}}`
+   Write it before you look at any outcome, and do not edit those fields
+   afterwards. If the data force a change, append an entry to `deviations`:
+   `{{"changed": "<what>", "why": "<the reason>", "when": "<before or after
+   seeing the result>"}}`. A deviation found after seeing the result is still
+   reportable — declaring it is what keeps the analysis honest; hiding it in a
+   revised plan is what does not.
+3. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
+   end-to-end: load → preprocess → analysis → conclusion. Report the
+   pre-specified primary comparison and every arm the claim names, including
+   the arms whose result argues against the claim. Anything beyond the plan is
+   welcome but labelled exploratory, and never replaces the primary result.
+4. Run it via papermill. Fix errors iteratively.
    Save the executed output as `analysis.ipynb`; every nonempty code cell
    must have an execution count. Never substitute synthetic data for the
    deposit. If the data cannot support the test, report the blocker.
-4. When the notebook runs cleanly, write a short summary of what you
+5. When the notebook runs cleanly, write a short summary of what you
    found and whether the claim is supported, partially supported, or
    not supported by the data. Be honest about assumptions and limits.
-5. Write `{STATUS_FILE}` in your working directory, as JSON:
+6. Write `{STATUS_FILE}` in your working directory, as JSON:
    `{{"status": "tested", "data_files": ["data/files/...", ...]}}` when the
    notebook analyzed the deposit's data, listing every data file it read.
    Each entry is a path relative to your working directory. A glob such as
@@ -443,6 +474,7 @@ def _format_datasets_brief(bb: Blackboard) -> str:
 
 
 STATUS_FILE = "analysis_status.json"
+PLAN_FILE = "analysis_plan.json"
 
 
 class NotTestable(RuntimeError):
@@ -489,6 +521,41 @@ minutes. Do not put it in the background and poll it with `sleep`: that spends
 your turns and your time budget on waiting. The download skips files already
 present at their published size, so if it is cut short, running the same
 command again resumes it rather than starting over."""
+
+
+PLAN_FIELDS = ("primary_comparison", "arms", "metric", "statistical_test")
+
+
+def check_analysis_plan(workdir: Path) -> dict:
+    """Require the analyst to have set down the test before running it.
+
+    The pre-specified prediction and experiment come from Hypothesize and were
+    what its critic accepted. Writing them down first, and declaring any
+    departure as a deviation, is what separates troubleshooting an analysis
+    from redesigning it around the result. A deviation is allowed; an
+    undeclared one is not, so an empty or reasonless entry fails here.
+    """
+    path = workdir / PLAN_FILE
+    if not path.is_file():
+        raise RuntimeError(f"the analyst did not write {PLAN_FILE}, so the test it ran "
+                           f"cannot be compared with the one that was approved")
+    try:
+        plan = json.loads(path.read_text())
+    except ValueError as exc:
+        raise RuntimeError(f"{PLAN_FILE} is not valid JSON: {exc}") from exc
+    empty = [f for f in PLAN_FIELDS if not plan.get(f)]
+    if empty:
+        raise RuntimeError(f"{PLAN_FILE} does not say: {', '.join(empty)}")
+    deviations = plan.get("deviations") or []
+    if not isinstance(deviations, list):
+        raise RuntimeError(f"{PLAN_FILE} has a 'deviations' that is not a list")
+    unexplained = [d for d in deviations
+                   if not isinstance(d, dict) or not d.get("changed") or not d.get("why")]
+    if unexplained:
+        raise RuntimeError(f"{PLAN_FILE} has {len(unexplained)} deviation(s) with no "
+                           f"'changed' and 'why'; an undeclared change to the plan is "
+                           f"the one thing the record cannot carry")
+    return plan
 
 
 def check_analysis_status(workdir: Path) -> dict:

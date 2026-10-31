@@ -43,7 +43,7 @@ BLOCKING_ATTACK_TAGS = ("[CONSTRAINT]", "[READOUT]")
 # again: each is a result to report, including `timed_out`, which says the
 # analysis did not finish inside its budget. To try one again, delete its
 # folder under `hypotheses/`.
-CONCLUSIVE = ("passed", "not_testable", "unresolved", "timed_out", "refused")
+CONCLUSIVE = ("passed", "not_testable", "unresolved", "timed_out", "refused", "failed")
 
 # What a resumed run has to put back on the hypothesis for Write to read.
 ANALYSIS_FIELDS = ("analysis_workdir", "analysis_summary", "analysis_cost_usd",
@@ -252,8 +252,8 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path,
     not_testable: dict[str, str] = {}
     unresolved: dict[str, str] = {}
     refused: dict[str, str] = {}
-    buckets = {"passed": passed, "not_testable": not_testable,
-               "unresolved": unresolved, "timed_out": unresolved, "refused": refused}
+    buckets = {"passed": passed, "not_testable": not_testable, "unresolved": unresolved,
+               "timed_out": unresolved, "failed": unresolved, "refused": refused}
     for position, hyp in enumerate(targets):
         if len(passed) >= wanted:
             break
@@ -305,6 +305,14 @@ async def run_analyze(bb: Blackboard, client: LLMClient, *, workdir: Path,
                 break
             except AllAnalystsRefused as exc:
                 _record_outcome(bb, hyp, folder, "refused", str(exc), refused)
+                break
+            except RuntimeError as exc:
+                # One hypothesis failing its own checks — a missing plan, a
+                # notebook that never ran — is that hypothesis's result, not
+                # the stage's. NotTestable and AllAnalystsRefused are
+                # RuntimeErrors too, so this clause comes after theirs.
+                # Delete the hypothesis folder to try it again.
+                _record_outcome(bb, hyp, folder, "failed", str(exc), unresolved)
                 break
             methods_critic.run(bb, client, hyp, notebook_path=folder / "analysis.ipynb")
             critique = hyp.methods_critique

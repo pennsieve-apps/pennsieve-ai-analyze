@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import claude_agent_sdk
@@ -24,6 +25,10 @@ def write_outputs(workdir):
     (workdir / "data/a.fcs").write_text("x")
     (workdir / agentic_analyst.STATUS_FILE).write_text(
         '{"status": "tested", "data_files": ["data/a.fcs"]}')
+    (workdir / agentic_analyst.PLAN_FILE).write_text(json.dumps({
+        "primary_comparison": "treated vs untreated", "arms": ["treated", "untreated"],
+        "metric": "background-subtracted gMFI", "planned_exclusions": [],
+        "statistical_test": "paired t-test, replicate as the unit", "deviations": []}))
 
 
 @pytest.mark.parametrize("subtype,notebook,passes", [("success", True, True), ("error_max_turns", True, False), ("success", False, False)])
@@ -285,3 +290,57 @@ def test_a_completed_session_records_one_row_only(monkeypatch, tmp_path):
     usage_log = []
     asyncio.run(agentic_analyst.run(bb, h, workdir=tmp_path, model_id="test", usage_log=usage_log))
     assert len(usage_log) == 1 and "partial" not in usage_log[0]
+
+
+# --- holding the analysis to the plan that was approved --------------------
+#
+# Hypothesize writes a predicted observation and an experiment, and its critic
+# accepts the hypothesis on them. Until now neither reached Analyze, so the
+# analyst designed its own test — and in seed 405 it dropped an arm the claim
+# named, swapped the metric, and excluded samples on the quantity under test.
+
+
+def _plan(**overrides):
+    plan = {"primary_comparison": "treated vs untreated", "arms": ["treated", "untreated"],
+            "metric": "background-subtracted gMFI", "planned_exclusions": [],
+            "statistical_test": "paired t-test, replicate as the unit", "deviations": []}
+    plan.update(overrides)
+    return plan
+
+
+def test_the_approved_test_reaches_the_analyst(tmp_path):
+    bb = Blackboard("q", "dataset")
+    h = Hypothesis("H1", "claim", "rationale", [], "H15K6 falls more than CD227 and H4K11",
+                   "stain all three clones, compare gMFI ratios")
+    prompt = agentic_analyst._build_task_prompt(bb, h, tmp_path)
+    assert "H15K6 falls more than CD227 and H4K11" in prompt
+    assert "stain all three clones" in prompt
+    assert "do not drop an arm the claim names" in prompt
+
+
+def test_an_analysis_with_no_recorded_plan_is_refused(tmp_path):
+    with pytest.raises(RuntimeError, match="did not write analysis_plan.json"):
+        agentic_analyst.check_analysis_plan(tmp_path)
+
+
+@pytest.mark.parametrize("missing", ["primary_comparison", "arms", "metric", "statistical_test"])
+def test_a_plan_that_omits_the_test_is_refused(tmp_path, missing):
+    (tmp_path / agentic_analyst.PLAN_FILE).write_text(json.dumps(_plan(**{missing: ""})))
+    with pytest.raises(RuntimeError, match=missing):
+        agentic_analyst.check_analysis_plan(tmp_path)
+
+
+def test_a_declared_deviation_is_allowed(tmp_path):
+    """Changing the plan is permitted; the record just has to carry it."""
+    plan = _plan(deviations=[{"changed": "dropped the H4K11 arm",
+                              "why": "untreated signal below the detection floor",
+                              "when": "after seeing the result"}])
+    (tmp_path / agentic_analyst.PLAN_FILE).write_text(json.dumps(plan))
+    assert agentic_analyst.check_analysis_plan(tmp_path)["deviations"][0]["changed"]
+
+
+def test_a_deviation_with_no_reason_is_refused(tmp_path):
+    (tmp_path / agentic_analyst.PLAN_FILE).write_text(
+        json.dumps(_plan(deviations=[{"changed": "dropped the H4K11 arm"}])))
+    with pytest.raises(RuntimeError, match="no 'changed' and 'why'"):
+        agentic_analyst.check_analysis_plan(tmp_path)

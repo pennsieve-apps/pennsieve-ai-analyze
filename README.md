@@ -54,6 +54,20 @@ hypothesis as **unresolved** and exits 8. Both write the reason to
 `not_testable.json` or `unresolved.json` in the hypothesis folder, keep the
 notebooks, and do not count as a pass, so Write builds no manuscript on them.
 
+**The approved test is the test that runs.** Hypothesize records a predicted
+observation and a suggested experiment, and its critic accepts the hypothesis
+on them. Both are given to the analyst as the plan to follow, and to the
+methods critic as the standard to judge against. Before computing any result
+the analyst writes `analysis_plan.json` — the primary comparison, the arms the
+claim names, the metric, the planned exclusions and the statistical test — and
+any later change goes in `deviations` with a reason. Troubleshooting (code,
+gates, file handling) is expected; dropping an arm, swapping the metric,
+narrowing the comparison, excluding samples on the quantity under test, or
+choosing a multiplicity family after seeing results is a `plan_deviation`
+issue at high severity unless it was declared. That sends the hypothesis back
+for a revision round rather than letting the analysis settle around its own
+result.
+
 **Budgets bound a hypothesis, not the stage.** A wall-clock cap on the whole
 stage fires in the middle of a hypothesis and takes the finished ones down with
 it, leaving a run nobody can interpret. Instead each hypothesis has its own
