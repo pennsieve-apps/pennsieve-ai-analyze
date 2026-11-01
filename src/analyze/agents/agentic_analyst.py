@@ -619,10 +619,40 @@ def _entry_matches_a_file(workdir: Path, entry: str) -> bool:
     return inside_and_real(workdir / text)
 
 
+# Fields only a code cell may carry. An analyst that edits notebook JSON directly can turn a
+# code cell into markdown and leave these behind, which nbformat's schema rejects.
+CODE_ONLY_CELL_FIELDS = ("execution_count", "outputs")
+
+
+def tidy_notebook(path: Path) -> list[int]:
+    """Drop code-only fields from non-code cells, in place, and return the cells changed.
+
+    The fields mean nothing on a markdown or raw cell, so removing them changes no
+    code, output or result. Without this, a harmless leftover from editing the JSON
+    fails schema validation and discards an otherwise finished analysis.
+    """
+    import json
+
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    changed = []
+    for i, cell in enumerate(notebook.get("cells", [])):
+        if cell.get("cell_type") != "code" and any(k in cell for k in CODE_ONLY_CELL_FIELDS):
+            for key in CODE_ONLY_CELL_FIELDS:
+                cell.pop(key, None)
+            changed.append(i)
+    if changed:
+        path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return changed
+
+
 def validate_notebook(path: Path) -> None:
     """Require actual executed cells; absence of errors alone is insufficient."""
     import nbformat
 
+    tidied = tidy_notebook(path)
+    if tidied:
+        print(f"  [analyze] {path.name}: removed code-only fields from non-code cells {tidied}",
+              flush=True)
     notebook = nbformat.read(path, as_version=4)
     nbformat.validate(notebook)
     code = [c for c in notebook.cells if c.cell_type == "code" and c.source.strip()]
