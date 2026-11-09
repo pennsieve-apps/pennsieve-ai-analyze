@@ -45,6 +45,17 @@ parameters:
     type: integer
     defaultValue: 3
     min: 1
+  - name: VP_ANALYZE_HYPOTHESIS_TIMEOUT_S
+    label: Time budget per hypothesis
+    description: Seconds one hypothesis may take across all its rounds. Past it the hypothesis is recorded as timed out and the next one starts, so a stuck analyst costs one hypothesis rather than the whole stage.
+    type: integer
+    defaultValue: 5400
+    min: 60
+  - name: VP_RUN_COST_LIMIT_USD
+    label: Run cost ceiling (USD)
+    description: Stop the run once it has cost this much, counting the earlier stages. Checked between hypotheses, so everything already analyzed stays complete and readable. Leave empty for no ceiling.
+    type: string
+    required: false
   - name: VP_ANALYZE_STAGE_DATA
     label: Pre-download data
     description: "1 downloads a sample of the seed dataset's files before the analyst starts; 0 writes only the file index."

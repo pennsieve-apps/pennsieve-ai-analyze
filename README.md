@@ -2,9 +2,19 @@
 
 Stage 3 of the `pennsieve-ai-*` research pipeline. Reads the blackboard
 produced by [`pennsieve-ai-hypothesize`](https://github.com/Pennsieve/pennsieve-ai-hypothesize),
-runs an agentic analysis against the first accepted hypothesis in the final iteration
-(or first N, configurable), and emits an updated blackboard for the downstream
-Write stage.
+runs an agentic analysis against the best-ranked accepted hypothesis in the final
+iteration (or the best N, configurable), and emits an updated blackboard for the
+downstream Write stage.
+
+Accepted hypotheses are ranked by the critic's scores: feasibility first, then
+novelty, then the sum of all four scores. Fewer `[CONSTRAINT]` or `[READOUT]`
+attacks break a tie, and Hypothesize's list order breaks what is left. The
+ranking is logged as `analyze: selection`.
+
+If a chosen hypothesis turns out not testable, or its methods review is still
+unresolved after the last round, Analyze moves on to the next-ranked one and
+logs `analyze: fallback`. It stops once `VP_ANALYZE_TOP_N` have passed or
+`VP_ANALYZE_MAX_ATTEMPTS` have been tried.
 
 ## What it does
 
@@ -43,6 +53,44 @@ review simply never passes within the allowed rounds, it records the
 hypothesis as **unresolved** and exits 8. Both write the reason to
 `not_testable.json` or `unresolved.json` in the hypothesis folder, keep the
 notebooks, and do not count as a pass, so Write builds no manuscript on them.
+
+**The approved test is the test that runs.** Hypothesize records a predicted
+observation and a suggested experiment, and its critic accepts the hypothesis
+on them. Both are given to the analyst as the plan to follow, and to the
+methods critic as the standard to judge against. Before computing any result
+the analyst writes `analysis_plan.json` — the primary comparison, the arms the
+claim names, the metric, the planned exclusions and the statistical test — and
+any later change goes in `deviations` with a reason. Troubleshooting (code,
+gates, file handling) is expected; dropping an arm, swapping the metric,
+narrowing the comparison, excluding samples on the quantity under test, or
+choosing a multiplicity family after seeing results is a `plan_deviation`
+issue at high severity unless it was declared. That sends the hypothesis back
+for a revision round rather than letting the analysis settle around its own
+result.
+
+**Budgets bound a hypothesis, not the stage.** A wall-clock cap on the whole
+stage fires in the middle of a hypothesis and takes the finished ones down with
+it, leaving a run nobody can interpret. Instead each hypothesis has its own
+time budget (`VP_ANALYZE_HYPOTHESIS_TIMEOUT_S`): past it the hypothesis is
+recorded as **timed out** and the next one starts. A run cost ceiling
+(`VP_RUN_COST_LIMIT_USD`) stops the stage between hypotheses, where everything
+finished is already on disk, and exits 9.
+
+**Every hypothesis is checkpointed.** The moment one settles — passed, not
+testable, unresolved, timed out or refused — its outcome and the fields Write
+reads are written to `hypotheses/<id>/outcome.json`. Running the stage again
+skips what is already settled, so a retry pays only for the undecided ones.
+An attempt that died mid-analysis leaves no outcome, so its folder is moved to
+`<id>.attempt<n>` and the hypothesis is analyzed again on a clean directory.
+To retry one that did settle, delete its folder.
+
+**Refusals.** If the analyst's model refuses the task, Analyze reruns that
+round on `VP_ANALYZE_FALLBACK_MODEL` (Opus 4.7 by default) and keeps that model
+for the rest of the stage. It logs `analyze: refusal_fallback`. If every model
+refuses, the hypothesis is recorded as **refused** (`refused.json`) and the
+next-ranked hypothesis is tried. If none passes, the stage fails. The methods
+critic's refusals are handled by the model client (see `VP_MODEL_REASONING_FALLBACK`
+in the pennsieve-ai-utils README).
 
 At startup, Analyze asks the governor which models it allows. It then sends a
 tiny test request to each model it plans to use. The analyst uses the
@@ -118,15 +166,20 @@ python -m analyze.main
 | `AWS_REGION` | _(required for `bedrock`)_ | This is the Bedrock region. Claude Code does not read the region from your AWS profile, so you must set it here. |
 | `VP_MODEL_BULK` | chosen at startup | On `bedrock` or `anthropic`, Claude Code uses this model for its small background requests. |
 | `VP_LOG_LLM_IO` | unset | Set this to `1` to save model requests and responses word for word. The methods critic's requests go to `llm-io.analyze.jsonl`. The file `agent-events.jsonl` becomes a full record of the Claude Code session. |
-| `VP_ANALYZE_TOP_N` | `1` | How many accepted hypotheses from the final iteration to analyze. Raise it to test several in one run; each that passes is written up, and the rest are recorded as not testable or unresolved. |
-| `VP_ANALYZE_HYPOTHESIS_IDS` | unset | A comma-separated list of hypothesis IDs to analyze, in order, instead of taking the top `VP_ANALYZE_TOP_N`. Each ID must be accepted at the final iteration. Use it to reach a specific accepted hypothesis when the first one is not testable. |
+| `VP_ANALYZE_TOP_N` | `all` | How many of the best-ranked accepted hypotheses from the final iteration to analyze. `all` tests every accepted hypothesis, as the prototype did. A number tests only the best-ranked ones; each that passes is written up, and the rest are recorded as not testable or unresolved. |
+| `VP_ANALYZE_MAX_ATTEMPTS` | all accepted, or `VP_ANALYZE_TOP_N` + 1 | The most hypotheses Analyze will try, counting fallbacks. Each try is a full analyst session, so this caps the spending. Set it equal to `VP_ANALYZE_TOP_N` to turn the fallback off. |
+| `VP_ANALYZE_HYPOTHESIS_IDS` | unset | A comma-separated list of hypothesis IDs to analyze, in order, instead of taking the best-ranked `VP_ANALYZE_TOP_N`. It overrides the ranking, and there is no fallback. Each ID must be accepted at the final iteration. Use it to reach a specific accepted hypothesis when the top-ranked one is not testable. |
 | `VP_ANALYZE_MAX_TURNS` | `80` | Per-hypothesis turn budget for the Claude Code loop |
 | `VP_ANALYZE_MAX_METHODS_ITERS` | `3` | Maximum analyst/critic passes before an unresolved methods review fails the stage |
+| `VP_ANALYZE_HYPOTHESIS_TIMEOUT_S` | `5400` | How long one hypothesis may take, across all its rounds. Past it the hypothesis is recorded as `timed_out` and the next one starts, so a stuck analyst costs one hypothesis rather than the stage. `off` removes the cap. |
+| `VP_RUN_COST_LIMIT_USD` | unset | A ceiling on what the whole run may cost, counting the earlier stages. It is checked between hypotheses, where everything finished is already on disk, and the stage exits 9. Raise it and run the stage again to continue. |
+| `VP_ANALYZE_RESUME` | `1` | Skip hypotheses whose outcome is already recorded in `hypotheses/<id>/outcome.json`, so a retry pays only for the undecided ones. Set to `0` to analyze everything again. To retry one hypothesis, delete its folder. |
 | `VP_ANALYZE_STAGE_FILES` | `12` | How many of the seed dataset's data files to download before the analyst starts |
 | `VP_ANALYZE_STAGE_MAX_MB` | `200` | Total size budget, in MiB, for that pre-download |
 | `VP_ANALYZE_STAGE_DATA` | unset | Set to `0` to write only the file index and download nothing |
 | `VP_MODEL_SONNET` | dynamically resolved | Explicit pin for the Agent SDK analyst's model role |
 | `VP_ANALYZE_MODEL` | unset | Backward-compatible alias for `VP_MODEL_SONNET`; conflicting pins fail preflight |
+| `VP_ANALYZE_FALLBACK_MODEL` | `us.anthropic.claude-opus-4-7` | Comma-separated models the analyst moves to when its model refuses the task. Also passed to Claude Code's own fallback for an overloaded or unavailable model. `none` turns it off. |
 | `VP_MODEL_OPUS` | dynamically resolved | Explicit pin for the methods critic's reasoning role |
 | `VP_LLM_MAX_RETRIES` | `1` on the governor, `4` on `bedrock` or `anthropic` | How many times the Anthropic SDK retries a failed request. The governor keeps one retry, because each of its timeouts already takes a minute. Direct backends retry more, to ride out short network dropouts. |
 

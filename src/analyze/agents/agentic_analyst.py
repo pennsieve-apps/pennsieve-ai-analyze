@@ -39,6 +39,7 @@ from pathlib import Path
 from pennsieve_ai_utils.backend import claude_code_env, llm_backend
 from pennsieve_ai_utils.blackboard import Blackboard, Hypothesis
 from pennsieve_ai_utils.llm import raw_io_enabled
+from pennsieve_ai_utils.models import OPUS_FALLBACKS
 
 from analyze import data_staging
 
@@ -50,6 +51,26 @@ MAX_TURNS = int(os.environ.get("VP_ANALYZE_MAX_TURNS", "80"))
 # Claude Code names its tools mcp__<server>__<tool>.
 MCP_SERVER = "pennsieve"
 MCP_TOOL_PREFIX = f"mcp__{MCP_SERVER}__"
+
+# The analyst's models when its first model refuses the task: the shared
+# Opus chain, newest first. Opus 5.5 refused seed 405; the older Opus models
+# have not refused any of the pipeline's datasets.
+DEFAULT_ANALYST_FALLBACKS = OPUS_FALLBACKS
+
+
+def analyst_fallbacks(model_id: str, can_invoke=None) -> list[str]:
+    """Models to try, in order, after `model_id` refuses the task.
+
+    `VP_ANALYZE_FALLBACK_MODEL` is a comma-separated list that replaces the
+    default; `none` turns the fallback off. With `can_invoke` (usually
+    `LLMClient.can_invoke`), models the account cannot call are dropped.
+    """
+    configured = os.environ.get("VP_ANALYZE_FALLBACK_MODEL", "").strip()
+    if configured.lower() in ("none", "off"):
+        return []
+    models = [m.strip() for m in configured.split(",") if m.strip()] or list(DEFAULT_ANALYST_FALLBACKS)
+    return [m for m in models if m != model_id and (can_invoke is None or can_invoke(m))]
+
 
 # Tool results are cut to this many characters in the trace, unless
 # VP_LOG_LLM_IO=1 asks for the full transcript.
@@ -63,6 +84,7 @@ async def run(
     workdir: Path,
     model_id: str,
     background_model: str = "",
+    can_invoke=None,
     usage_log: list[dict] | None = None,
 ) -> None:
     """Drive one analyst session against one hypothesis.
@@ -71,6 +93,8 @@ async def run(
     direct backend; the governor path leaves that to the platform.
     `usage_log` is the stage's usage list (`LLMClient.usage_log`); the
     session's token counts are added to it as one `agent_sdk_result` row.
+    `analyst_fallbacks` also go to Claude Code's own fallback, which covers a
+    model that is overloaded or unavailable. A refusal raises `AnalystRefused`.
     """
     try:
         from claude_agent_sdk import (
@@ -124,6 +148,8 @@ async def run(
         can_use_tool=_allow_all,
         cwd=str(hyp_workdir),
         env=claude_code_env(background_model),
+        # Claude Code takes one fallback, for a model that is overloaded or unavailable.
+        fallback_model=next(iter(analyst_fallbacks(model_id, can_invoke)), None),
     )
 
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -131,6 +157,14 @@ async def run(
     total_cost = 0.0
     final_text = ""
     completed = False
+    refused = False
+    # The SDK reports the session's usage only on its result message, so a
+    # session that is cancelled or crashes spends real money and leaves no
+    # usage row. Keep a running total from the per-turn usage instead, and
+    # record it if the result never arrives.
+    turn_totals = dict.fromkeys(USAGE_KEYS, 0)
+    turns_seen = 0
+    usage_recorded = False
     trace_path = hyp_workdir / "agent-events.jsonl"
 
     def event(kind, **fields):
@@ -182,9 +216,16 @@ async def run(
                             final_text = block.text
                             if raw:
                                 event("text", text=block.text)
+                if getattr(msg, "stop_reason", None) == "refusal" and not refused:
+                    refused = True
+                    event("refusal", model=getattr(msg, "model", None) or model_id)
                 usage = getattr(msg, "usage", None)
-                if raw and usage and not hasattr(msg, "is_error"):
-                    event("turn_usage", model=getattr(msg, "model", None), usage=usage)
+                if usage and not hasattr(msg, "is_error"):
+                    turns_seen += 1
+                    for key in USAGE_KEYS:
+                        turn_totals[key] += _count(usage, key)
+                    if raw:
+                        event("turn_usage", model=getattr(msg, "model", None), usage=usage)
                 cost = getattr(msg, "total_cost_usd", None)
                 if cost is not None:
                     total_cost = max(total_cost, float(cost))
@@ -195,13 +236,19 @@ async def run(
                     _record_sdk_usage(usage_log, hypothesis.id, model_id,
                                       getattr(msg, "usage", None) or {}, total_cost,
                                       len(tools_called), getattr(msg, "num_turns", None))
+                    usage_recorded = True
+                    if refused:
+                        raise AnalystRefused(model_id)
                     if msg.is_error or getattr(msg, "subtype", "") != "success":
                         raise RuntimeError(f"Agent did not complete: {getattr(msg, 'subtype', '?')}")
                     completed = True
                     final_text = getattr(msg, "result", None) or final_text
+        if refused:
+            raise AnalystRefused(model_id)
         if not completed or not final_text.strip():
             raise RuntimeError("Agent ended without a successful result and summary")
         validate_notebook(hyp_workdir / "analysis.ipynb")
+        check_analysis_plan(hyp_workdir)
         check_analysis_status(hyp_workdir)
     except NotTestable as e:
         hypothesis.analysis_cost_usd += total_cost
@@ -209,6 +256,11 @@ async def run(
         hypothesis.analysis_workdir = str(hyp_workdir.relative_to(workdir.resolve().parent))
         hypothesis.analysis_summary = final_text[:8000]
         bb.log("agentic_analyst", "not_testable", f"hypothesis {hypothesis.id}: {e}")
+        raise
+    except AnalystRefused as e:
+        hypothesis.analysis_cost_usd += total_cost
+        hypothesis.analysis_tools_called.extend(tools_called)
+        bb.log("agentic_analyst", "refused", f"hypothesis {hypothesis.id}: {e}")
         raise
     except Exception as e:
         hypothesis.analysis_cost_usd += total_cost
@@ -220,6 +272,13 @@ async def run(
         raise RuntimeError(
             f"Agentic analysis failed for hypothesis {hypothesis.id}"
         ) from e
+    finally:
+        # Whatever ended the session — a cancelled timeout, a crash, a refusal —
+        # the turns it took were billed. Record them so the run's cost is the
+        # cost of the run.
+        if not usage_recorded:
+            _record_sdk_usage(usage_log, hypothesis.id, model_id, turn_totals, total_cost,
+                              len(tools_called), turns_seen, partial=True)
 
     # Record artifacts on the hypothesis. The Write stage reads these to
     # produce the final report.
@@ -237,10 +296,22 @@ async def run(
     )
 
 
-def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, tools, turns) -> None:
+USAGE_KEYS = ("input_tokens", "output_tokens",
+              "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _count(usage, key: str) -> int:
+    value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, 0)
+    return int(value or 0)
+
+
+def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, tools, turns,
+                      *, partial: bool = False) -> None:
     """Add the analyst session's token counts to the stage usage log.
 
-    The Agent SDK reports the session's total usage on its result message.
+    The Agent SDK reports the session's total usage on its result message. A
+    session that never reaches one still spent its turns, so `partial` marks a
+    row summed from the per-turn usage instead.
     Only token counts are stored, under the same field names as the other
     usage rows, so cost can be worked out later from a price table. The SDK's
     own `total_cost_usd` comes from Claude Code's built-in Anthropic list
@@ -251,8 +322,7 @@ def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, t
         return
 
     def count(key):
-        value = sdk_usage.get(key) if isinstance(sdk_usage, dict) else getattr(sdk_usage, key, 0)
-        return int(value or 0)
+        return _count(sdk_usage, key)
 
     usage_log.append({
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -268,6 +338,9 @@ def _record_sdk_usage(usage_log, hypothesis_id, model_id, sdk_usage, sdk_cost, t
         "tools_called": tools,
         "turns": turns,
         "sdk_reported_cost_usd": float(sdk_cost),
+        # Summed from the turns rather than read off a result message that
+        # never came, so the session's tokens still reach the cost total.
+        **({"partial": True} if partial else {}),
     })
 
 
@@ -305,6 +378,19 @@ root privileges; standard `pip install` will fail.
 **Claim to test:** {hypothesis.claim}
 
 **Rationale:** {hypothesis.rationale}
+
+**Predicted observation (pre-specified):** {hypothesis.predicted_observation}
+
+**Experiment to run (pre-specified):** {hypothesis.suggested_experiment}
+
+The predicted observation and the experiment above are the approved plan: a
+hypothesis critic accepted this hypothesis on the strength of that specific
+test. They are what you run. Troubleshooting is expected — fixing code,
+chasing down file layouts, correcting a gate, making a tool call work. Changing
+*what is tested* is not: do not drop an arm the claim names, do not swap the
+metric the prediction states, do not narrow the comparison, and do not exclude
+samples on the basis of the quantity you are testing. A test the deposit cannot
+support is reported as `not_testable`, never quietly replaced by one it can.
 {revision}
 
 {data_access}
@@ -323,19 +409,36 @@ root privileges; standard `pip install` will fail.
    available, call `describe_discover_folder` on each folder you plan to use.
    If the deposit cannot test the claim as stated, do not substitute a proxy:
    write a short notebook that documents the check, and report the status
-   `not_testable` (step 5).
+   `not_testable` (step 6).
    Then inspect the data itself. Look at actual columns, dtypes, NaN rates —
    do NOT assume schema from the title alone.
-2. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
-   end-to-end: load → preprocess → analysis → conclusion.
-3. Run it via papermill. Fix errors iteratively.
+2. Before computing any result, write `{PLAN_FILE}`, as JSON, setting down the
+   test you are about to run, taken from the pre-specified plan above:
+   `{{"primary_comparison": "<the one comparison that decides the claim>",
+     "arms": ["<every group or condition the claim names>"],
+     "metric": "<the quantity compared, as the prediction states it>",
+     "planned_exclusions": ["<any, with the control-or-QC reason>"],
+     "statistical_test": "<the test and what counts as the independent unit>",
+     "deviations": []}}`
+   Write it before you look at any outcome, and do not edit those fields
+   afterwards. If the data force a change, append an entry to `deviations`:
+   `{{"changed": "<what>", "why": "<the reason>", "when": "<before or after
+   seeing the result>"}}`. A deviation found after seeing the result is still
+   reportable — declaring it is what keeps the analysis honest; hiding it in a
+   revised plan is what does not.
+3. Write a Jupyter notebook (`analysis.ipynb`) that tests the claim
+   end-to-end: load → preprocess → analysis → conclusion. Report the
+   pre-specified primary comparison and every arm the claim names, including
+   the arms whose result argues against the claim. Anything beyond the plan is
+   welcome but labelled exploratory, and never replaces the primary result.
+4. Run it via papermill. Fix errors iteratively.
    Save the executed output as `analysis.ipynb`; every nonempty code cell
    must have an execution count. Never substitute synthetic data for the
    deposit. If the data cannot support the test, report the blocker.
-4. When the notebook runs cleanly, write a short summary of what you
+5. When the notebook runs cleanly, write a short summary of what you
    found and whether the claim is supported, partially supported, or
    not supported by the data. Be honest about assumptions and limits.
-5. Write `{STATUS_FILE}` in your working directory, as JSON:
+6. Write `{STATUS_FILE}` in your working directory, as JSON:
    `{{"status": "tested", "data_files": ["data/files/...", ...]}}` when the
    notebook analyzed the deposit's data, listing every data file it read.
    Each entry is a path relative to your working directory. A glob such as
@@ -371,11 +474,21 @@ def _format_datasets_brief(bb: Blackboard) -> str:
 
 
 STATUS_FILE = "analysis_status.json"
+PLAN_FILE = "analysis_plan.json"
 
 
 class NotTestable(RuntimeError):
     """The deposit cannot test the hypothesis as stated. An honest outcome,
     recorded on the hypothesis; it is not an analysis failure."""
+
+
+class AnalystRefused(RuntimeError):
+    """The session's model refused the task (stop_reason "refusal"). The
+    pipeline reruns the round on a fallback model (`VP_ANALYZE_FALLBACK_MODEL`)."""
+
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        super().__init__(f"{model_id} refused the analysis task")
 
 PENNSIEVE_TOOLS_SECTION = """## Pennsieve tools
 
@@ -401,7 +514,48 @@ You also have Pennsieve tools for published datasets. They are public and need n
   metadata, other published datasets, and DOI lookups.
 
 Download the files your notebook analyzes into `data/` with the download
-command above, so the notebook can be run again."""
+command above, so the notebook can be run again.
+
+Run that download in the foreground and wait for it, even when it takes
+minutes. Do not put it in the background and poll it with `sleep`: that spends
+your turns and your time budget on waiting. The download skips files already
+present at their published size, so if it is cut short, running the same
+command again resumes it rather than starting over."""
+
+
+PLAN_FIELDS = ("primary_comparison", "arms", "metric", "statistical_test")
+
+
+def check_analysis_plan(workdir: Path) -> dict:
+    """Require the analyst to have set down the test before running it.
+
+    The pre-specified prediction and experiment come from Hypothesize and were
+    what its critic accepted. Writing them down first, and declaring any
+    departure as a deviation, is what separates troubleshooting an analysis
+    from redesigning it around the result. A deviation is allowed; an
+    undeclared one is not, so an empty or reasonless entry fails here.
+    """
+    path = workdir / PLAN_FILE
+    if not path.is_file():
+        raise RuntimeError(f"the analyst did not write {PLAN_FILE}, so the test it ran "
+                           f"cannot be compared with the one that was approved")
+    try:
+        plan = json.loads(path.read_text())
+    except ValueError as exc:
+        raise RuntimeError(f"{PLAN_FILE} is not valid JSON: {exc}") from exc
+    empty = [f for f in PLAN_FIELDS if not plan.get(f)]
+    if empty:
+        raise RuntimeError(f"{PLAN_FILE} does not say: {', '.join(empty)}")
+    deviations = plan.get("deviations") or []
+    if not isinstance(deviations, list):
+        raise RuntimeError(f"{PLAN_FILE} has a 'deviations' that is not a list")
+    unexplained = [d for d in deviations
+                   if not isinstance(d, dict) or not d.get("changed") or not d.get("why")]
+    if unexplained:
+        raise RuntimeError(f"{PLAN_FILE} has {len(unexplained)} deviation(s) with no "
+                           f"'changed' and 'why'; an undeclared change to the plan is "
+                           f"the one thing the record cannot carry")
+    return plan
 
 
 def check_analysis_status(workdir: Path) -> dict:
@@ -465,10 +619,40 @@ def _entry_matches_a_file(workdir: Path, entry: str) -> bool:
     return inside_and_real(workdir / text)
 
 
+# Fields only a code cell may carry. An analyst that edits notebook JSON directly can turn a
+# code cell into markdown and leave these behind, which nbformat's schema rejects.
+CODE_ONLY_CELL_FIELDS = ("execution_count", "outputs")
+
+
+def tidy_notebook(path: Path) -> list[int]:
+    """Drop code-only fields from non-code cells, in place, and return the cells changed.
+
+    The fields mean nothing on a markdown or raw cell, so removing them changes no
+    code, output or result. Without this, a harmless leftover from editing the JSON
+    fails schema validation and discards an otherwise finished analysis.
+    """
+    import json
+
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    changed = []
+    for i, cell in enumerate(notebook.get("cells", [])):
+        if cell.get("cell_type") != "code" and any(k in cell for k in CODE_ONLY_CELL_FIELDS):
+            for key in CODE_ONLY_CELL_FIELDS:
+                cell.pop(key, None)
+            changed.append(i)
+    if changed:
+        path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    return changed
+
+
 def validate_notebook(path: Path) -> None:
     """Require actual executed cells; absence of errors alone is insufficient."""
     import nbformat
 
+    tidied = tidy_notebook(path)
+    if tidied:
+        print(f"  [analyze] {path.name}: removed code-only fields from non-code cells {tidied}",
+              flush=True)
     notebook = nbformat.read(path, as_version=4)
     nbformat.validate(notebook)
     code = [c for c in notebook.cells if c.cell_type == "code" and c.source.strip()]

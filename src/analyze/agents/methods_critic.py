@@ -31,8 +31,11 @@ def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_p
     if not notebook_text:
         raise RuntimeError("Methods critic requires the executed notebook, not just a summary")
     notebook_text = _compact_notebook(notebook_text)
-    status_path = (notebook_path.parent if notebook_path else Path(".")) / "analysis_status.json"
+    folder = notebook_path.parent if notebook_path else Path(".")
+    status_path = folder / "analysis_status.json"
     status_text = status_path.read_text() if status_path.is_file() else "(the analyst wrote no status file)"
+    plan_path = folder / "analysis_plan.json"
+    plan_text = plan_path.read_text() if plan_path.is_file() else "(the analyst wrote no plan)"
 
     system = (
         "You are a methods critic reviewing an automated data analysis. "
@@ -50,13 +53,33 @@ def run(bb: Blackboard, client: LLMClient, hypothesis: Hypothesis, *, notebook_p
         "the data or the hypothesis itself lacks what is needed (the assay is "
         "not a valid readout of the claim, the needed samples, replicates or "
         "conditions are not in the deposit). Be strict: use data_limit only "
-        "when you can say what is missing from the deposit."
+        "when you can say what is missing from the deposit. "
+        "\"plan_deviation\": the analysis is not the one that was approved. "
+        "The predicted observation and suggested experiment below were "
+        "pre-specified, and a hypothesis critic accepted the hypothesis on "
+        "them; the analyst recorded its own plan before running. Check the "
+        "notebook against both. An arm the claim names but the analysis drops, "
+        "a metric swapped for another, a comparison narrowed, samples excluded "
+        "on the basis of the quantity being tested, or a multiplicity family "
+        "chosen after seeing the results, is a plan_deviation at high severity "
+        "unless the analyst declared it in 'deviations' with a reason. "
+        "Troubleshooting — fixing code, gates, file handling — is not a "
+        "deviation. Say plainly when the analysis did follow the plan."
     )
     user = f"""## Hypothesis
 {hypothesis.claim}
 
 ## Rationale
 {hypothesis.rationale}
+
+## Predicted observation (pre-specified)
+{hypothesis.predicted_observation}
+
+## Experiment to run (pre-specified)
+{hypothesis.suggested_experiment}
+
+## The analyst's own plan, written before it ran (analysis_plan.json)
+{plan_text}
 
 ## Analyst summary
 {hypothesis.analysis_summary}
@@ -74,7 +97,7 @@ Produce a JSON object with this shape:
 {{
   "verdict": "sound" | "concerns" | "unsound",
   "issues": [
-    {{"severity": "high|medium|low", "kind": "fixable|data_limit", "section": "<notebook section or 'overall'>", "description": "..."}}
+    {{"severity": "high|medium|low", "kind": "fixable|data_limit|plan_deviation", "section": "<notebook section or 'overall'>", "description": "..."}}
   ],
   "suggested_followups": ["..."]
 }}

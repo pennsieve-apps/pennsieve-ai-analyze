@@ -20,9 +20,11 @@ import os
 import sys
 from dataclasses import replace
 
+from pennsieve_ai_utils import pricing
 from pennsieve_ai_utils.backend import llm_backend, missing_config
 from pennsieve_ai_utils.llm import LLMClient
 from pennsieve_ai_utils.models import ROLES, ModelNotAvailable
+from pennsieve_ai_utils.run_report import read_jsonl
 from pennsieve_ai_utils.processor import (
     ProcessorEnv,
     install_sigterm_handler,
@@ -30,7 +32,7 @@ from pennsieve_ai_utils.processor import (
     write_outputs,
 )
 
-from analyze.pipeline import NotTestableStage, ReviewUnresolved, run_analyze
+from analyze.pipeline import CostLimitReached, NotTestableStage, ReviewUnresolved, run_analyze
 
 STAGE = "analyze"
 
@@ -104,8 +106,20 @@ def main() -> int:
     bb.log(STAGE, "models",
            ", ".join(f"{role}={a['model_id']}" for role, a in sorted(assignments.items())))
 
+    # The cost ceiling covers the run, not this stage, so start from what the
+    # upstream stages already spent. Their usage log is carried forward into
+    # this stage's input directory.
+    spent_before = pricing.summarize_usage(read_jsonl(env.input_dir / "usage.jsonl"))["cost_usd"]
+
     try:
-        asyncio.run(run_analyze(bb, client, workdir=output_dir))
+        asyncio.run(run_analyze(bb, client, workdir=output_dir, spent_before=spent_before))
+    except CostLimitReached as e:
+        # Not a crash: the stage stopped on a budget, between hypotheses, with
+        # everything analyzed so far recorded. A rerun resumes from there.
+        bb.log(STAGE, "cost_limit", str(e))
+        write_outputs(bb, output_dir, client.usage_log, stage=STAGE)
+        print(f"\nStopped on the cost ceiling.\n  {e}", flush=True)
+        return 9
     except NotTestableStage as e:
         # An honest result, not a crash: the deposit cannot test the hypotheses
         # analyzed. Outputs are kept, and the stage does not pass, so Write does
